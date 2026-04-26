@@ -262,7 +262,7 @@ impl Default for ReaderOptions {
             thumbnail_cache_bytes: 64 * 1024 * 1024,
             prefetch_forward: 4,
             prefetch_backward: 4,
-            thumbnail_edge: 256,
+            thumbnail_edge: 160,
         }
     }
 }

@@ -35,6 +35,7 @@ pub struct ComicReaderApp {
     image_sizes: HashMap<usize, [usize; 2]>,
     thumbnails: HashMap<usize, egui::TextureHandle>,
     last_thumbnail_request: Option<(usize, usize)>,
+    show_thumbnails: bool,
 }
 
 impl ComicReaderApp {
@@ -175,13 +176,13 @@ impl ComicReaderApp {
     }
 
     fn request_visible_thumbnails(&mut self) {
-        const THUMB_RADIUS: usize = 16;
+        const THUMB_RADIUS: usize = 8;
 
         let Some(handle) = &self.handle else {
             return;
         };
 
-        if self.page_count == 0 {
+        if self.page_count == 0 || !self.show_thumbnails {
             return;
         }
 
@@ -192,6 +193,23 @@ impl ComicReaderApp {
 
         handle.request_thumbnails(self.current_page, THUMB_RADIUS);
         self.last_thumbnail_request = Some(request);
+    }
+
+    fn update_thumbnail_visibility(&mut self, ctx: &egui::Context) {
+        const HOT_ZONE_HEIGHT: f32 = 36.0;
+        const HIDE_ABOVE_BOTTOM: f32 = 140.0;
+
+        let Some(pointer) = ctx.pointer_hover_pos() else {
+            self.show_thumbnails = false;
+            return;
+        };
+
+        let bottom = ctx.content_rect().bottom();
+        if pointer.y >= bottom - HOT_ZONE_HEIGHT {
+            self.show_thumbnails = true;
+        } else if pointer.y < bottom - HIDE_ABOVE_BOTTOM {
+            self.show_thumbnails = false;
+        }
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -304,7 +322,7 @@ impl ComicReaderApp {
             return;
         }
 
-        const THUMB_RADIUS: usize = 16;
+        const THUMB_RADIUS: usize = 8;
         let start = self.current_page.saturating_sub(THUMB_RADIUS);
         let end = (self.current_page + THUMB_RADIUS).min(self.page_count - 1);
 
@@ -368,13 +386,18 @@ impl eframe::App for ComicReaderApp {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
         self.handle_keyboard_shortcuts(&ctx);
+        self.update_thumbnail_visibility(&ctx);
         self.request_visible_thumbnails();
 
         ui.vertical(|ui| {
             self.top_bar(ui);
             ui.separator();
 
-            let thumbnail_height = if self.page_count > 0 { 98.0 } else { 0.0 };
+            let thumbnail_height = if self.show_thumbnails && self.page_count > 0 {
+                98.0
+            } else {
+                0.0
+            };
             let image_height = (ui.available_height() - thumbnail_height - 28.0).max(0.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), image_height),
@@ -384,7 +407,7 @@ impl eframe::App for ComicReaderApp {
                 },
             );
 
-            if self.page_count > 0 {
+            if self.show_thumbnails && self.page_count > 0 {
                 ui.separator();
                 self.thumbnail_strip(ui);
             }

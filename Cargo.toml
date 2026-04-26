@@ -12,3 +12,9 @@ resolver = "2"
 edition = "2021"
 license = "MIT"
 repository = "https://example.invalid/RustComicReader"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
