@@ -776,7 +776,7 @@ fn flow_thumb_quad(rect: egui::Rect, offset: f32) -> [egui::Pos2; 4] {
     }
 
     let fold = offset.abs().min(3.0) / 3.0;
-    let inset = rect.height() * (0.10 + 0.22 * fold);
+    let inset = rect.height() * (0.10 + 0.01 * fold);
     if offset < 0.0 {
         [
             rect.left_top(),
