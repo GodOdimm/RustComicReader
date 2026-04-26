@@ -31,8 +31,10 @@ pub struct ComicReaderApp {
     status: String,
     cache_status: String,
     textures: HashMap<usize, egui::TextureHandle>,
+    decoded_images: HashMap<usize, Arc<DecodedImage>>,
     image_sizes: HashMap<usize, [usize; 2]>,
     thumbnails: HashMap<usize, egui::TextureHandle>,
+    last_thumbnail_request: Option<(usize, usize)>,
 }
 
 impl ComicReaderApp {
@@ -47,8 +49,10 @@ impl ComicReaderApp {
 
     fn open_path(&mut self, path: PathBuf) {
         self.textures.clear();
+        self.decoded_images.clear();
         self.image_sizes.clear();
         self.thumbnails.clear();
+        self.last_thumbnail_request = None;
         self.current_page = 0;
         self.page_count = 0;
         self.cache_status.clear();
@@ -81,6 +85,7 @@ impl ComicReaderApp {
                 ReaderEvent::CurrentPage { page_index } => {
                     self.current_page = page_index;
                     self.status = format!("第 {} / {} 页", page_index + 1, self.page_count.max(1));
+                    self.upload_nearby_textures(ctx);
                 }
                 ReaderEvent::LoadingPage { page_index } => {
                     if page_index == self.current_page {
@@ -93,10 +98,13 @@ impl ComicReaderApp {
                     from_cache,
                     elapsed_ms,
                 } => {
-                    let texture = texture_from_image(ctx, "page", page_index, &image);
                     self.image_sizes
                         .insert(page_index, [image.width as usize, image.height as usize]);
-                    self.textures.insert(page_index, texture);
+                    self.decoded_images.insert(page_index, image.clone());
+                    if self.should_keep_texture(page_index) {
+                        self.upload_texture_for_page(ctx, page_index);
+                    }
+                    self.trim_page_textures();
 
                     if page_index == self.current_page {
                         let source = if from_cache { "缓存" } else { "解码" };
@@ -131,6 +139,59 @@ impl ComicReaderApp {
                 ReaderEvent::Finished => {}
             }
         }
+    }
+
+    fn upload_texture_for_page(&mut self, ctx: &egui::Context, page_index: usize) {
+        if self.textures.contains_key(&page_index) {
+            return;
+        }
+
+        if let Some(image) = self.decoded_images.get(&page_index) {
+            let texture = texture_from_image(ctx, "page", page_index, image);
+            self.textures.insert(page_index, texture);
+        }
+    }
+
+    fn upload_nearby_textures(&mut self, ctx: &egui::Context) {
+        for page in self.texture_window() {
+            self.upload_texture_for_page(ctx, page);
+        }
+        self.trim_page_textures();
+    }
+
+    fn should_keep_texture(&self, page_index: usize) -> bool {
+        self.current_page.abs_diff(page_index) <= 1
+    }
+
+    fn texture_window(&self) -> impl Iterator<Item = usize> {
+        let start = self.current_page.saturating_sub(1);
+        let end = (self.current_page + 1).min(self.page_count.saturating_sub(1));
+        start..=end
+    }
+
+    fn trim_page_textures(&mut self) {
+        let current = self.current_page;
+        self.textures.retain(|page, _| current.abs_diff(*page) <= 1);
+    }
+
+    fn request_visible_thumbnails(&mut self) {
+        const THUMB_RADIUS: usize = 16;
+
+        let Some(handle) = &self.handle else {
+            return;
+        };
+
+        if self.page_count == 0 {
+            return;
+        }
+
+        let request = (self.current_page, THUMB_RADIUS);
+        if self.last_thumbnail_request == Some(request) {
+            return;
+        }
+
+        handle.request_thumbnails(self.current_page, THUMB_RADIUS);
+        self.last_thumbnail_request = Some(request);
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -243,12 +304,22 @@ impl ComicReaderApp {
             return;
         }
 
+        const THUMB_RADIUS: usize = 16;
+        let start = self.current_page.saturating_sub(THUMB_RADIUS);
+        let end = (self.current_page + THUMB_RADIUS).min(self.page_count - 1);
+
         egui::ScrollArea::horizontal()
             .id_salt("thumbnail-strip")
             .max_height(92.0)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for page in 0..self.page_count {
+                    if start > 0 && ui.button("<<").clicked() {
+                        if let Some(handle) = &self.handle {
+                            handle.go_to(start.saturating_sub(THUMB_RADIUS));
+                        }
+                    }
+
+                    for page in start..=end {
                         let selected = page == self.current_page;
                         let fill = if selected {
                             ui.visuals().selection.bg_fill
@@ -281,6 +352,12 @@ impl ComicReaderApp {
                                 }
                             });
                     }
+
+                    if end + 1 < self.page_count && ui.button(">>").clicked() {
+                        if let Some(handle) = &self.handle {
+                            handle.go_to((end + THUMB_RADIUS).min(self.page_count - 1));
+                        }
+                    }
                 });
             });
     }
@@ -291,6 +368,7 @@ impl eframe::App for ComicReaderApp {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
         self.handle_keyboard_shortcuts(&ctx);
+        self.request_visible_thumbnails();
 
         ui.vertical(|ui| {
             self.top_bar(ui);

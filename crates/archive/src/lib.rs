@@ -11,27 +11,44 @@ use zip::ZipArchive;
 
 pub struct ZipArchiveBackend {
     path: PathBuf,
+    archive: Option<ZipArchive<File>>,
 }
 
 impl ZipArchiveBackend {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            archive: None,
+        }
     }
 
-    fn open_archive(&self) -> Result<ZipArchive<File>> {
+    fn open_archive(&mut self) -> Result<()> {
         let file = File::open(&self.path).map_err(|error| {
             ReaderError::Archive(format!("failed to open {}: {error}", self.path.display()))
         })?;
 
-        ZipArchive::new(file).map_err(|error| {
+        let archive = ZipArchive::new(file).map_err(|error| {
             ReaderError::Archive(format!("failed to parse {}: {error}", self.path.display()))
+        })?;
+
+        self.archive = Some(archive);
+        Ok(())
+    }
+
+    fn archive_mut(&mut self) -> Result<&mut ZipArchive<File>> {
+        if self.archive.is_none() {
+            self.open_archive()?;
+        }
+
+        self.archive.as_mut().ok_or_else(|| {
+            ReaderError::Archive(format!("failed to keep {} open", self.path.display()))
         })
     }
 }
 
 impl ArchiveBackend for ZipArchiveBackend {
     fn list_entries(&mut self) -> Result<Vec<ArchiveEntry>> {
-        let mut archive = self.open_archive()?;
+        let archive = self.archive_mut()?;
         let mut entries = Vec::new();
 
         for index in 0..archive.len() {
@@ -59,7 +76,7 @@ impl ArchiveBackend for ZipArchiveBackend {
     }
 
     fn read_entry(&mut self, entry_id: EntryId) -> Result<Bytes> {
-        let mut archive = self.open_archive()?;
+        let archive = self.archive_mut()?;
         let mut file = archive.by_index(entry_id.0).map_err(|error| {
             ReaderError::Archive(format!("failed to read zip entry {}: {error}", entry_id.0))
         })?;

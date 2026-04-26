@@ -37,6 +37,13 @@ fn main() {
         path.display()
     );
 
+    handle.request_thumbnails(0, 8);
+    let thumbnail_target = page_count.min(9);
+    if thumbnail_target > 0 {
+        let elapsed = wait_for_thumbnails(&handle, thumbnail_target, Duration::from_secs(30));
+        println!("thumbnail_batch_ms={elapsed} thumbnails={thumbnail_target}");
+    }
+
     let neighbor = 1.min(page_count.saturating_sub(1));
     if neighbor > 0 {
         handle.go_to(neighbor);
@@ -102,6 +109,46 @@ fn wait_for_page(handle: &ReaderHandle, page: usize, timeout: Duration) -> u128 
             Some(_) => {}
             None => {
                 eprintln!("reader stopped before decoding page {page}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn wait_for_thumbnails(handle: &ReaderHandle, count: usize, timeout: Duration) -> u128 {
+    let started = Instant::now();
+    let mut seen = 0;
+
+    loop {
+        if started.elapsed() > timeout {
+            eprintln!("timed out waiting for {count} thumbnails, got {seen}");
+            std::process::exit(1);
+        }
+
+        match handle.recv() {
+            Some(ReaderEvent::ThumbnailDecoded { .. }) => {
+                seen += 1;
+                if seen >= count {
+                    return started.elapsed().as_millis();
+                }
+            }
+            Some(ReaderEvent::CacheStats {
+                raw_bytes,
+                display_bytes,
+                thumbnail_bytes,
+            }) => {
+                eprintln!(
+                    "cache raw={} display={} thumb={}",
+                    raw_bytes, display_bytes, thumbnail_bytes
+                );
+            }
+            Some(ReaderEvent::Error(error)) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            Some(_) => {}
+            None => {
+                eprintln!("reader stopped before decoding thumbnails");
                 std::process::exit(1);
             }
         }

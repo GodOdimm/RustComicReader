@@ -1,8 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
@@ -63,6 +63,7 @@ pub trait ArchiveBackend: Send {
 pub trait ImageDecoder: Send + Sync + 'static {
     fn decode(&self, bytes: &[u8]) -> Result<DecodedImage>;
     fn thumbnail(&self, bytes: &[u8], max_edge: u32) -> Result<DecodedImage>;
+    fn thumbnail_from_decoded(&self, image: &DecodedImage, max_edge: u32) -> Result<DecodedImage>;
 }
 
 pub trait Cache<V: Clone + Send> {
@@ -271,6 +272,7 @@ pub enum ReaderCommand {
     GoTo(PageIndex),
     Next,
     Previous,
+    RequestThumbnails { center: PageIndex, radius: usize },
     Shutdown,
 }
 
@@ -323,6 +325,12 @@ impl ReaderHandle {
         let _ = self.command_tx.send(ReaderCommand::Previous);
     }
 
+    pub fn request_thumbnails(&self, center: PageIndex, radius: usize) {
+        let _ = self
+            .command_tx
+            .send(ReaderCommand::RequestThumbnails { center, radius });
+    }
+
     pub fn shutdown(&self) {
         let _ = self.command_tx.send(ReaderCommand::Shutdown);
     }
@@ -364,6 +372,10 @@ struct ReaderWorker {
     raw_cache: RawPageCache,
     display_cache: DisplayCache,
     thumbnail_cache: ThumbnailCache,
+    prefetch_queue: VecDeque<PageIndex>,
+    thumbnail_queue: VecDeque<PageIndex>,
+    queued_thumbnails: HashSet<PageIndex>,
+    prefetches_since_thumbnail: usize,
 }
 
 impl ReaderWorker {
@@ -383,6 +395,10 @@ impl ReaderWorker {
             options,
             command_rx,
             event_tx,
+            prefetch_queue: VecDeque::new(),
+            thumbnail_queue: VecDeque::new(),
+            queued_thumbnails: HashSet::new(),
+            prefetches_since_thumbnail: 0,
         }
     }
 
@@ -409,61 +425,98 @@ impl ReaderWorker {
         let _ = self.event_tx.send(ReaderEvent::CurrentPage {
             page_index: current,
         });
+        self.rebuild_prefetch_queue(&order, current);
 
         loop {
-            match self.load_window(&order, current) {
-                WindowResult::Continue => {}
-                WindowResult::JumpTo(next) => {
-                    current = next.min(page_count.saturating_sub(1));
-                    let _ = self.event_tx.send(ReaderEvent::CurrentPage {
-                        page_index: current,
-                    });
+            if let Some(control) = self.drain_commands(current, page_count) {
+                match control {
+                    WindowResult::JumpTo(next) => {
+                        current = next;
+                        let _ = self.event_tx.send(ReaderEvent::CurrentPage {
+                            page_index: current,
+                        });
+                        self.rebuild_prefetch_queue(&order, current);
+                        continue;
+                    }
+                    WindowResult::Shutdown => break,
+                    WindowResult::Continue => {}
+                }
+            }
+
+            if let Err(error) = self.ensure_decoded(&order, current) {
+                self.emit_error(error);
+            }
+            self.emit_cache_stats();
+
+            if let Some(control) = self.wait_for_command_if_idle(current, page_count) {
+                match control {
+                    WindowResult::JumpTo(next) => {
+                        current = next;
+                        let _ = self.event_tx.send(ReaderEvent::CurrentPage {
+                            page_index: current,
+                        });
+                        self.rebuild_prefetch_queue(&order, current);
+                    }
+                    WindowResult::Shutdown => break,
+                    WindowResult::Continue => {}
+                }
+                continue;
+            }
+
+            if self.should_run_thumbnail_before_prefetch() {
+                if let Some(page) = self.thumbnail_queue.pop_front() {
+                    self.queued_thumbnails.remove(&page);
+                    if let Err(error) = self.ensure_thumbnail(&order, page) {
+                        self.emit_error(error);
+                    }
+                    self.prefetches_since_thumbnail = 0;
+                    self.emit_cache_stats();
                     continue;
                 }
-                WindowResult::Shutdown => break,
             }
 
-            match self.command_rx.recv() {
-                Ok(ReaderCommand::GoTo(page)) => {
-                    current = page.min(page_count.saturating_sub(1));
+            if let Some(page) = self.prefetch_queue.pop_front() {
+                if page != current && !self.display_cache.contains(page) {
+                    if let Err(error) = self.ensure_decoded(&order, page) {
+                        self.emit_error(error);
+                    }
+                    self.prefetches_since_thumbnail += 1;
+                    self.emit_cache_stats();
                 }
-                Ok(ReaderCommand::Next) => {
-                    current = (current + 1).min(page_count.saturating_sub(1));
-                }
-                Ok(ReaderCommand::Previous) => {
-                    current = current.saturating_sub(1);
-                }
-                Ok(ReaderCommand::Shutdown) | Err(_) => break,
+                continue;
             }
 
-            let _ = self.event_tx.send(ReaderEvent::CurrentPage {
-                page_index: current,
-            });
+            if let Some(page) = self.thumbnail_queue.pop_front() {
+                self.queued_thumbnails.remove(&page);
+                if let Err(error) = self.ensure_thumbnail(&order, page) {
+                    self.emit_error(error);
+                }
+                self.emit_cache_stats();
+                continue;
+            }
         }
 
         let _ = self.event_tx.send(ReaderEvent::Finished);
     }
 
-    fn load_window(&mut self, order: &PageOrder, current: PageIndex) -> WindowResult {
+    fn rebuild_prefetch_queue(&mut self, order: &PageOrder, current: PageIndex) {
         let pages = order.prioritized_window(
             current,
             self.options.prefetch_forward,
             self.options.prefetch_backward,
         );
 
-        for page in pages {
-            if let Some(control) = self.drain_commands(current, order.len()) {
-                return control;
-            }
+        self.prefetch_queue = pages
+            .into_iter()
+            .filter(|page| *page != current)
+            .collect::<VecDeque<_>>();
+        self.prefetches_since_thumbnail = 0;
+    }
 
-            if let Err(error) = self.ensure_decoded(order, page) {
-                self.emit_error(error);
-            }
-
-            self.emit_cache_stats();
-        }
-
-        WindowResult::Continue
+    fn should_run_thumbnail_before_prefetch(&self) -> bool {
+        !self.thumbnail_queue.is_empty()
+            && !self.prefetch_queue.is_empty()
+            && self.prefetches_since_thumbnail >= 2
     }
 
     fn ensure_decoded(&mut self, order: &PageOrder, page: PageIndex) -> Result<()> {
@@ -508,21 +561,47 @@ impl ReaderWorker {
             elapsed_ms,
         });
 
-        if !self.thumbnail_cache.contains(page) {
-            if let Ok(thumbnail) = self.decoder.thumbnail(&raw, self.options.thumbnail_edge) {
-                self.thumbnail_cache
-                    .insert(page, thumbnail.clone(), thumbnail.byte_len());
-                let _ = self.event_tx.send(ReaderEvent::ThumbnailDecoded {
-                    page_index: page,
-                    image: Arc::new(thumbnail),
-                });
-            }
-        }
-
         Ok(())
     }
 
-    fn drain_commands(&self, current: PageIndex, page_count: usize) -> Option<WindowResult> {
+    fn ensure_thumbnail(&mut self, order: &PageOrder, page: PageIndex) -> Result<()> {
+        if let Some(thumbnail) = self.thumbnail_cache.get(page) {
+            let _ = self.event_tx.send(ReaderEvent::ThumbnailDecoded {
+                page_index: page,
+                image: Arc::new(thumbnail),
+            });
+            return Ok(());
+        }
+
+        let thumbnail = if let Some(decoded) = self.display_cache.get(page) {
+            self.decoder
+                .thumbnail_from_decoded(&decoded, self.options.thumbnail_edge)?
+        } else {
+            let page_descriptor = order.page(page).ok_or(ReaderError::PageOutOfRange {
+                index: page,
+                page_count: order.len(),
+            })?;
+            let raw = match self.raw_cache.get(page) {
+                Some(raw) => raw,
+                None => {
+                    let raw = self.backend.read_entry(page_descriptor.entry_id)?;
+                    self.raw_cache.insert(page, raw.clone(), raw.len());
+                    raw
+                }
+            };
+            self.decoder.thumbnail(&raw, self.options.thumbnail_edge)?
+        };
+
+        self.thumbnail_cache
+            .insert(page, thumbnail.clone(), thumbnail.byte_len());
+        let _ = self.event_tx.send(ReaderEvent::ThumbnailDecoded {
+            page_index: page,
+            image: Arc::new(thumbnail),
+        });
+        Ok(())
+    }
+
+    fn drain_commands(&mut self, current: PageIndex, page_count: usize) -> Option<WindowResult> {
         let mut latest = None;
 
         loop {
@@ -530,6 +609,9 @@ impl ReaderWorker {
                 Ok(ReaderCommand::GoTo(page)) => latest = Some(page.min(page_count - 1)),
                 Ok(ReaderCommand::Next) => latest = Some((current + 1).min(page_count - 1)),
                 Ok(ReaderCommand::Previous) => latest = Some(current.saturating_sub(1)),
+                Ok(ReaderCommand::RequestThumbnails { center, radius }) => {
+                    self.enqueue_thumbnails(center, radius, page_count);
+                }
                 Ok(ReaderCommand::Shutdown) => return Some(WindowResult::Shutdown),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Some(WindowResult::Shutdown),
@@ -537,6 +619,58 @@ impl ReaderWorker {
         }
 
         latest.map(WindowResult::JumpTo)
+    }
+
+    fn wait_for_command_if_idle(
+        &mut self,
+        current: PageIndex,
+        page_count: usize,
+    ) -> Option<WindowResult> {
+        if !self.prefetch_queue.is_empty() || !self.thumbnail_queue.is_empty() {
+            if let Ok(command) = self.command_rx.recv_timeout(Duration::from_millis(1)) {
+                return self.apply_command(command, current, page_count);
+            }
+            return None;
+        }
+
+        match self.command_rx.recv() {
+            Ok(command) => self.apply_command(command, current, page_count),
+            Err(_) => Some(WindowResult::Shutdown),
+        }
+    }
+
+    fn apply_command(
+        &mut self,
+        command: ReaderCommand,
+        current: PageIndex,
+        page_count: usize,
+    ) -> Option<WindowResult> {
+        match command {
+            ReaderCommand::GoTo(page) => Some(WindowResult::JumpTo(page.min(page_count - 1))),
+            ReaderCommand::Next => Some(WindowResult::JumpTo((current + 1).min(page_count - 1))),
+            ReaderCommand::Previous => Some(WindowResult::JumpTo(current.saturating_sub(1))),
+            ReaderCommand::RequestThumbnails { center, radius } => {
+                self.enqueue_thumbnails(center, radius, page_count);
+                Some(WindowResult::Continue)
+            }
+            ReaderCommand::Shutdown => Some(WindowResult::Shutdown),
+        }
+    }
+
+    fn enqueue_thumbnails(&mut self, center: PageIndex, radius: usize, page_count: usize) {
+        if page_count == 0 {
+            return;
+        }
+
+        let center = center.min(page_count - 1);
+        let start = center.saturating_sub(radius);
+        let end = (center + radius).min(page_count - 1);
+
+        for page in start..=end {
+            if !self.thumbnail_cache.contains(page) && self.queued_thumbnails.insert(page) {
+                self.thumbnail_queue.push_back(page);
+            }
+        }
     }
 
     fn emit_cache_stats(&self) {

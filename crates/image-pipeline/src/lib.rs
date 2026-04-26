@@ -50,4 +50,19 @@ impl ImageDecoder for ImageCrateDecoder {
             rgba: thumbnail.into_raw(),
         })
     }
+
+    fn thumbnail_from_decoded(&self, image: &DecodedImage, max_edge: u32) -> Result<DecodedImage> {
+        let rgba = image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
+            .ok_or_else(|| ReaderError::Decode("invalid decoded RGBA buffer".to_string()))?;
+        let thumbnail = image::DynamicImage::ImageRgba8(rgba)
+            .resize(max_edge, max_edge, self.thumbnail_filter)
+            .to_rgba8();
+        let (width, height) = thumbnail.dimensions();
+
+        Ok(DecodedImage {
+            width,
+            height,
+            rgba: thumbnail.into_raw(),
+        })
+    }
 }
