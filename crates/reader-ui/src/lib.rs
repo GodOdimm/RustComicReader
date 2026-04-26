@@ -47,6 +47,7 @@ pub struct ComicReaderApp {
     flow_animated: f32,
     flow_page_input: String,
     last_image_width: f32,
+    last_image_height: f32,
 }
 
 impl ComicReaderApp {
@@ -81,6 +82,7 @@ impl ComicReaderApp {
         self.flow_animated = 0.0;
         self.flow_page_input.clear();
         self.last_image_width = 0.0;
+        self.last_image_height = 0.0;
         self.cache_status.clear();
         self.status = format!("正在打开 {}", path.display());
 
@@ -286,7 +288,7 @@ impl ComicReaderApp {
 
     fn update_thumbnail_visibility(&mut self, ctx: &egui::Context) {
         const HOT_ZONE_HEIGHT: f32 = 36.0;
-        const HIDE_ABOVE_BOTTOM: f32 = 190.0;
+        let hide_above_bottom = self.flow_height(ctx.content_rect().height()) + 44.0;
 
         let Some(pointer) = ctx.pointer_hover_pos() else {
             self.show_thumbnails = false;
@@ -296,9 +298,19 @@ impl ComicReaderApp {
         let bottom = ctx.content_rect().bottom();
         if pointer.y >= bottom - HOT_ZONE_HEIGHT {
             self.show_thumbnails = true;
-        } else if pointer.y < bottom - HIDE_ABOVE_BOTTOM {
+        } else if pointer.y < bottom - hide_above_bottom {
             self.show_thumbnails = false;
         }
+    }
+
+    fn flow_height(&self, available_height: f32) -> f32 {
+        let preferred = if self.last_image_height > 0.0 {
+            self.last_image_height * 0.40
+        } else {
+            available_height * 0.32
+        };
+
+        preferred.clamp(220.0, (available_height * 0.48).max(220.0))
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -398,6 +410,7 @@ impl ComicReaderApp {
             .unwrap_or_else(|| texture.size_vec2());
         let fit = fit_size(image_size, available);
         self.last_image_width = fit.x;
+        self.last_image_height = fit.y;
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -413,23 +426,26 @@ impl ComicReaderApp {
             return;
         }
 
-        const HEIGHT: f32 = 158.0;
-        const PAGE_STEP: f32 = 72.0;
-        const VISIBLE_RADIUS: isize = 6;
+        const VISIBLE_RADIUS: isize = 5;
+        const SIDE_THUMB_SCALE: f32 = 0.90;
 
         self.update_flow_animation(ui.ctx());
 
         let available_width = ui.available_width();
+        let height = ui.available_height().max(220.0);
+        let center_thumb_height = height * 0.72;
+        let center_thumb_width = center_thumb_height * 0.62;
+        let page_step = (center_thumb_width * 0.56).clamp(72.0, 132.0);
         let strip_width = if self.last_image_width > 0.0 {
             self.last_image_width.min(available_width)
         } else {
             available_width
         };
         let (outer_rect, _) =
-            ui.allocate_exact_size(egui::vec2(available_width, HEIGHT), egui::Sense::hover());
+            ui.allocate_exact_size(egui::vec2(available_width, height), egui::Sense::hover());
         let rect = egui::Rect::from_center_size(
             outer_rect.center(),
-            egui::vec2(strip_width.max(320.0).min(available_width), HEIGHT),
+            egui::vec2(strip_width.max(360.0).min(available_width), height),
         );
 
         let response = ui.interact(
@@ -473,22 +489,34 @@ impl ComicReaderApp {
         );
 
         let center_x = rect.center().x;
-        let base_y = rect.top() + 78.0;
+        let base_y = rect.top() + height * 0.48;
         let start = (self.flow_center as isize - VISIBLE_RADIUS).max(0) as usize;
         let end = (self.flow_center + VISIBLE_RADIUS as usize).min(self.page_count - 1);
 
-        for page in start..=end {
+        let mut pages: Vec<usize> = (start..=end).collect();
+        pages.sort_by(|a, b| {
+            let a_distance = (*a as f32 - self.flow_animated).abs();
+            let b_distance = (*b as f32 - self.flow_animated).abs();
+            b_distance.total_cmp(&a_distance)
+        });
+
+        for page in pages {
             let offset = page as f32 - self.flow_animated;
             if offset.abs() > VISIBLE_RADIUS as f32 + 0.5 {
                 continue;
             }
 
-            let depth = (1.0 - offset.abs() * 0.115).clamp(0.35, 1.0);
+            let abs_offset = offset.abs();
+            let depth = (1.0 - abs_offset * 0.12).clamp(0.28, 1.0);
             let selected = page == self.flow_target;
-            let max_size = egui::vec2(88.0, 112.0);
-            let size = max_size * if selected { 1.0 } else { 0.76 * depth };
-            let fold = offset.signum() * offset.abs().min(1.0) * 12.0;
-            let center = egui::pos2(center_x + offset * PAGE_STEP, base_y + offset.abs() * 10.0);
+            let max_size = egui::vec2(center_thumb_width, center_thumb_height);
+            let size = if selected {
+                max_size
+            } else {
+                max_size * SIDE_THUMB_SCALE
+            };
+            let fold = offset.signum() * abs_offset.min(1.0) * center_thumb_width * 0.20;
+            let center = egui::pos2(center_x + offset * page_step, base_y + abs_offset * 11.0);
             let thumb_rect = egui::Rect::from_center_size(center, size);
             let shadow = thumb_rect.translate(egui::vec2(fold * 0.18, 6.0));
 
@@ -520,19 +548,32 @@ impl ComicReaderApp {
             } else {
                 egui::Color32::from_rgb(58, 58, 66)
             };
-            painter.rect_filled(thumb_rect, egui::CornerRadius::same(7), frame_color);
+            let quad = flow_thumb_quad(thumb_rect, offset);
+            painter.add(egui::Shape::convex_polygon(
+                quad.to_vec(),
+                frame_color,
+                egui::Stroke::new(
+                    if page == self.current_page { 3.0 } else { 1.0 },
+                    if page == self.current_page {
+                        egui::Color32::from_rgb(70, 210, 235)
+                    } else {
+                        egui::Color32::from_gray(85)
+                    },
+                ),
+            ));
 
             if let Some(texture) = self.thumbnails.get(&page) {
-                let image_rect = fit_rect(texture.size_vec2(), thumb_rect.shrink(4.0));
-                painter.image(
+                let image_rect = fit_rect(texture.size_vec2(), thumb_rect.shrink(5.0));
+                let image_quad = flow_thumb_quad(image_rect, offset);
+                paint_textured_quad(
+                    &painter,
                     texture.id(),
-                    image_rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    image_quad,
                     egui::Color32::WHITE.linear_multiply(depth),
                 );
 
                 let edge_width = (fold.abs() * 0.45).max(2.0);
-                let edge_rect = if offset >= 0.0 {
+                let edge_rect = if offset < 0.0 {
                     egui::Rect::from_min_max(
                         image_rect.right_top() - egui::vec2(edge_width, 0.0),
                         image_rect.right_bottom(),
@@ -625,12 +666,13 @@ impl eframe::App for ComicReaderApp {
 
             if self.show_thumbnails && self.page_count > 0 {
                 let rect = ui.max_rect();
+                let flow_height = self.flow_height(rect.height());
                 egui::Area::new(egui::Id::new("thumbnail-flow-area"))
                     .order(egui::Order::Foreground)
-                    .fixed_pos(egui::pos2(rect.left(), rect.bottom() - 166.0))
+                    .fixed_pos(egui::pos2(rect.left(), rect.bottom() - flow_height - 8.0))
                     .show(&ctx, |ui| {
                         ui.set_width(rect.width());
-                        ui.set_height(158.0);
+                        ui.set_height(flow_height);
                         self.thumbnail_strip(ui);
                     });
             }
@@ -713,8 +755,76 @@ fn fit_size(image_size: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {
 }
 
 fn fit_rect(image_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
-    let size = fit_size(image_size, bounds.size());
+    if image_size.x <= 0.0 || image_size.y <= 0.0 || bounds.width() <= 0.0 || bounds.height() <= 0.0
+    {
+        return bounds;
+    }
+
+    let scale = (bounds.width() / image_size.x).min(bounds.height() / image_size.y);
+    let size = image_size * scale;
     egui::Rect::from_center_size(bounds.center(), size)
+}
+
+fn flow_thumb_quad(rect: egui::Rect, offset: f32) -> [egui::Pos2; 4] {
+    if offset.abs() < 0.35 {
+        return [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ];
+    }
+
+    let fold = offset.abs().min(3.0) / 3.0;
+    let inset = rect.height() * (0.10 + 0.22 * fold);
+    if offset < 0.0 {
+        [
+            rect.left_top(),
+            rect.right_top() + egui::vec2(0.0, inset),
+            rect.right_bottom() - egui::vec2(0.0, inset),
+            rect.left_bottom(),
+        ]
+    } else {
+        [
+            rect.left_top() + egui::vec2(0.0, inset),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom() - egui::vec2(0.0, inset),
+        ]
+    }
+}
+
+fn paint_textured_quad(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    points: [egui::Pos2; 4],
+    tint: egui::Color32,
+) {
+    let mut mesh = egui::Mesh::with_texture(texture_id);
+    mesh.vertices.extend_from_slice(&[
+        egui::epaint::Vertex {
+            pos: points[0],
+            uv: egui::pos2(0.0, 0.0),
+            color: tint,
+        },
+        egui::epaint::Vertex {
+            pos: points[1],
+            uv: egui::pos2(1.0, 0.0),
+            color: tint,
+        },
+        egui::epaint::Vertex {
+            pos: points[2],
+            uv: egui::pos2(1.0, 1.0),
+            color: tint,
+        },
+        egui::epaint::Vertex {
+            pos: points[3],
+            uv: egui::pos2(0.0, 1.0),
+            color: tint,
+        },
+    ]);
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 fn format_bytes(bytes: usize) -> String {
