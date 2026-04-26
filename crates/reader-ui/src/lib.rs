@@ -427,7 +427,7 @@ impl ComicReaderApp {
         }
 
         const VISIBLE_RADIUS: isize = 5;
-        const SIDE_THUMB_SCALE: f32 = 0.90;
+        const SIDE_THUMB_SCALE: f32 = 0.95;
         const CENTER_SIDE_GAP_RATIO: f32 = 0.08;
         const SIDE_STACK_STEP_RATIO: f32 = 0.35;
 
@@ -552,29 +552,8 @@ impl ComicReaderApp {
                 }
             }
 
-            let frame_color = if page == self.current_page {
-                ui.visuals().selection.bg_fill
-            } else if selected {
-                egui::Color32::from_rgb(120, 120, 135)
-            } else {
-                egui::Color32::from_rgb(58, 58, 66)
-            };
-            let quad = flow_thumb_quad(thumb_rect, offset);
-            painter.add(egui::Shape::convex_polygon(
-                quad.to_vec(),
-                frame_color,
-                egui::Stroke::new(
-                    if page == self.current_page { 3.0 } else { 1.0 },
-                    if page == self.current_page {
-                        egui::Color32::from_rgb(70, 210, 235)
-                    } else {
-                        egui::Color32::from_gray(85)
-                    },
-                ),
-            ));
-
             if let Some(texture) = self.thumbnails.get(&page) {
-                let image_rect = fit_rect(texture.size_vec2(), thumb_rect.shrink(5.0));
+                let image_rect = fit_rect(texture.size_vec2(), thumb_rect);
                 let image_quad = flow_thumb_quad(image_rect, offset);
                 paint_textured_quad(
                     &painter,
@@ -663,10 +642,17 @@ impl eframe::App for ComicReaderApp {
         self.request_visible_thumbnails();
 
         ui.vertical(|ui| {
-            self.top_bar(ui);
-            ui.separator();
+            let reading_mode = self.handle.is_some();
+            if !reading_mode {
+                self.top_bar(ui);
+                ui.separator();
+            }
 
-            let image_height = (ui.available_height() - 28.0).max(0.0);
+            let image_height = if reading_mode {
+                ui.available_height()
+            } else {
+                (ui.available_height() - 28.0).max(0.0)
+            };
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), image_height),
                 egui::Layout::top_down(egui::Align::Center),
@@ -688,18 +674,20 @@ impl eframe::App for ComicReaderApp {
                     });
             }
 
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(&self.status);
-                if !self.cache_status.is_empty() {
-                    ui.separator();
-                    ui.label(&self.cache_status);
-                }
-                if let Some(path) = &self.current_path {
-                    ui.separator();
-                    ui.label(path.display().to_string());
-                }
-            });
+            if !reading_mode {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&self.status);
+                    if !self.cache_status.is_empty() {
+                        ui.separator();
+                        ui.label(&self.cache_status);
+                    }
+                    if let Some(path) = &self.current_path {
+                        ui.separator();
+                        ui.label(path.display().to_string());
+                    }
+                });
+            }
         });
 
         if self.handle.is_some() {
