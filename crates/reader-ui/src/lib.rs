@@ -1,0 +1,291 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use archive::backend_for_path;
+use eframe::egui;
+use image_pipeline::ImageCrateDecoder;
+use reader_core::{spawn_reader, DecodedImage, ReaderEvent, ReaderHandle, ReaderOptions};
+
+pub fn run() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 900.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "RustComicReader",
+        options,
+        Box::new(|creation_context| Ok(Box::new(ComicReaderApp::new(creation_context)))),
+    )
+}
+
+#[derive(Default)]
+pub struct ComicReaderApp {
+    handle: Option<ReaderHandle>,
+    current_path: Option<PathBuf>,
+    path_input: String,
+    current_page: usize,
+    page_count: usize,
+    status: String,
+    cache_status: String,
+    textures: HashMap<usize, egui::TextureHandle>,
+    current_image_size: Option<[usize; 2]>,
+}
+
+impl ComicReaderApp {
+    pub fn new(_creation_context: &eframe::CreationContext<'_>) -> Self {
+        Self {
+            status: "打开一个 CBZ/ZIP 漫画或图片文件夹开始阅读".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn open_path(&mut self, path: PathBuf) {
+        self.textures.clear();
+        self.current_image_size = None;
+        self.current_page = 0;
+        self.page_count = 0;
+        self.cache_status.clear();
+        self.status = format!("正在打开 {}", path.display());
+
+        match backend_for_path(&path) {
+            Ok(backend) => {
+                let decoder = Arc::new(ImageCrateDecoder::new());
+                self.handle = Some(spawn_reader(backend, decoder, ReaderOptions::default()));
+                self.current_path = Some(path);
+            }
+            Err(error) => {
+                self.handle = None;
+                self.status = error.to_string();
+            }
+        }
+    }
+
+    fn drain_events(&mut self, ctx: &egui::Context) {
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+
+        while let Some(event) = handle.try_recv() {
+            match event {
+                ReaderEvent::PageCount { pages } => {
+                    self.page_count = pages;
+                    self.status = format!("共 {pages} 页");
+                }
+                ReaderEvent::CurrentPage { page_index } => {
+                    self.current_page = page_index;
+                    self.status = format!("第 {} / {} 页", page_index + 1, self.page_count.max(1));
+                }
+                ReaderEvent::LoadingPage { page_index } => {
+                    if page_index == self.current_page {
+                        self.status = format!("正在加载第 {} 页", page_index + 1);
+                    }
+                }
+                ReaderEvent::PageDecoded {
+                    page_index,
+                    image,
+                    from_cache,
+                    elapsed_ms,
+                } => {
+                    let texture = texture_from_image(ctx, page_index, &image);
+                    self.current_image_size = Some([image.width as usize, image.height as usize]);
+                    self.textures.insert(page_index, texture);
+
+                    if page_index == self.current_page {
+                        let source = if from_cache { "缓存" } else { "解码" };
+                        self.status = format!(
+                            "第 {} / {} 页，{}耗时 {}ms",
+                            page_index + 1,
+                            self.page_count.max(1),
+                            source,
+                            elapsed_ms
+                        );
+                    }
+                }
+                ReaderEvent::CacheStats {
+                    raw_bytes,
+                    display_bytes,
+                    thumbnail_bytes,
+                } => {
+                    self.cache_status = format!(
+                        "raw {} | display {} | thumb {}",
+                        format_bytes(raw_bytes),
+                        format_bytes(display_bytes),
+                        format_bytes(thumbnail_bytes)
+                    );
+                }
+                ReaderEvent::Error(error) => {
+                    self.status = error;
+                }
+                ReaderEvent::Finished | ReaderEvent::ThumbnailDecoded { .. } => {}
+            }
+        }
+    }
+
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("路径");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.path_input)
+                    .desired_width(420.0)
+                    .hint_text("/path/to/comic.cbz 或图片文件夹"),
+            );
+            let open_requested = ui.button("打开").clicked()
+                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+
+            if open_requested && !self.path_input.trim().is_empty() {
+                self.open_path(PathBuf::from(self.path_input.trim()));
+            }
+
+            ui.separator();
+
+            let can_read = self.handle.is_some() && self.page_count > 0;
+            if ui
+                .add_enabled(
+                    can_read && self.current_page > 0,
+                    egui::Button::new("上一页"),
+                )
+                .clicked()
+            {
+                if let Some(handle) = &self.handle {
+                    handle.previous();
+                }
+            }
+
+            if ui
+                .add_enabled(
+                    can_read && self.current_page + 1 < self.page_count,
+                    egui::Button::new("下一页"),
+                )
+                .clicked()
+            {
+                if let Some(handle) = &self.handle {
+                    handle.next();
+                }
+            }
+
+            if can_read {
+                let mut page = self.current_page + 1;
+                let response = ui.add(
+                    egui::DragValue::new(&mut page)
+                        .range(1..=self.page_count)
+                        .speed(1),
+                );
+                if response.changed() {
+                    if let Some(handle) = &self.handle {
+                        handle.go_to(page.saturating_sub(1));
+                    }
+                }
+                ui.label(format!("/ {}", self.page_count));
+            }
+        });
+    }
+
+    fn image_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(texture) = self.textures.get(&self.current_page) else {
+            ui.centered_and_justified(|ui| {
+                ui.label(&self.status);
+            });
+            return;
+        };
+
+        let available = ui.available_size();
+        let image_size = self
+            .current_image_size
+            .map(|[width, height]| egui::vec2(width as f32, height as f32))
+            .unwrap_or_else(|| texture.size_vec2());
+        let fit = fit_size(image_size, available);
+
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add(egui::Image::new((texture.id(), fit)));
+                });
+            });
+    }
+}
+
+impl eframe::App for ComicReaderApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_events(ctx);
+
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            self.top_bar(ui);
+        });
+
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(&self.status);
+                if !self.cache_status.is_empty() {
+                    ui.separator();
+                    ui.label(&self.cache_status);
+                }
+                if let Some(path) = &self.current_path {
+                    ui.separator();
+                    ui.label(path.display().to_string());
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.image_panel(ui);
+        });
+
+        if self.handle.is_some() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn texture_from_image(
+    ctx: &egui::Context,
+    page_index: usize,
+    image: &DecodedImage,
+) -> egui::TextureHandle {
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        [image.width as usize, image.height as usize],
+        &image.rgba,
+    );
+
+    ctx.load_texture(
+        format!("page-{page_index}"),
+        color_image,
+        egui::TextureOptions::LINEAR,
+    )
+}
+
+fn fit_size(image_size: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {
+    if image_size.x <= 0.0 || image_size.y <= 0.0 || available.x <= 0.0 || available.y <= 0.0 {
+        return image_size;
+    }
+
+    let scale = (available.x / image_size.x).min(available.y / image_size.y);
+    image_size * scale.min(1.0)
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+
+    if bytes as f64 >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes as f64 >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+#[allow(dead_code)]
+fn is_supported_open_path(path: &Path) -> bool {
+    path.is_dir()
+        || matches!(
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase())
+                .as_deref(),
+            Some("cbz" | "zip")
+        )
+}

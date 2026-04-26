@@ -1,0 +1,9 @@
+[package]
+name = "image-pipeline"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { version = "=0.25.6", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+reader-core = { path = "../reader-core" }

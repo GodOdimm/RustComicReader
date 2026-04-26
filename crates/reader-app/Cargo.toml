@@ -1,0 +1,12 @@
+[package]
+name = "reader-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+archive = { path = "../archive" }
+eframe = { version = "=0.28.1", default-features = false, features = ["default_fonts", "wgpu"] }
+image-pipeline = { path = "../image-pipeline" }
+reader-core = { path = "../reader-core" }
+reader-ui = { path = "../reader-ui" }

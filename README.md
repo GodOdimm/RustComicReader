@@ -1,1 +1,27 @@
 # RustComicReader
+
+RustComicReader 是对原项目 YACReader 阅读器模块的 Rust 重构原型，当前重点是验证高性能漫画阅读管线：按条目读取 CBZ/ZIP、当前页优先、后台解码、固定窗口缓存和 egui/wgpu 显示。
+
+## 运行阅读器原型
+
+```shell
+cargo run -p reader-app
+```
+
+启动后在顶部输入 CBZ/ZIP 文件路径或图片文件夹路径，然后点击“打开”。
+
+## 运行性能压测
+
+```shell
+cargo run --release -p reader-app --bin bench_reader -- /path/to/100mb-comic.cbz
+```
+
+压测会输出首屏、邻近页、远距离跳页耗时，并打印缓存占用。
+
+## Workspace 结构
+
+- `crates/reader-core`：阅读器核心 trait、页面排序、LRU 缓存、后台调度和事件流。
+- `crates/archive`：ZIP/CBZ 与图片文件夹 backend。
+- `crates/image-pipeline`：图片解码和缩略图生成。
+- `crates/reader-ui`：egui/wgpu 最小阅读 UI。
+- `crates/reader-app`：应用入口和压测命令。

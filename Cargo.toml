@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/archive",
+    "crates/image-pipeline",
+    "crates/reader-app",
+    "crates/reader-core",
+    "crates/reader-ui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://example.invalid/RustComicReader"
