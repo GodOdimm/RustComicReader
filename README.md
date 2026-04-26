@@ -10,7 +10,13 @@ RustComicReader 是对原项目 YACReader 阅读器模块的 Rust 重构原型�
 cargo run -p reader-app
 ```
 
-启动后在顶部输入 CBZ/ZIP 文件路径或图片文件夹路径，然后点击“打开”。
+启动后会全屏显示。按 `O` 键打开 macOS 文件选择框并选择 CBZ/ZIP 漫画。
+
+也可以在启动时传入漫画路径，适合由其他项目调用：
+
+```shell
+cargo run -p reader-app -- /path/to/comic.cbz
+```
 
 ## 运行性能压测
 

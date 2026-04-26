@@ -8,16 +8,23 @@ use eframe::egui;
 use image_pipeline::ImageCrateDecoder;
 use reader_core::{spawn_reader, DecodedImage, ReaderEvent, ReaderHandle, ReaderOptions};
 
-pub fn run() -> eframe::Result<()> {
+pub fn run(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 900.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 900.0])
+            .with_fullscreen(true),
         ..Default::default()
     };
 
     eframe::run_native(
         "RustComicReader",
         options,
-        Box::new(|creation_context| Ok(Box::new(ComicReaderApp::new(creation_context)))),
+        Box::new(|creation_context| {
+            Ok(Box::new(ComicReaderApp::new(
+                creation_context,
+                initial_path,
+            )))
+        }),
     )
 }
 
@@ -25,7 +32,6 @@ pub fn run() -> eframe::Result<()> {
 pub struct ComicReaderApp {
     handle: Option<ReaderHandle>,
     current_path: Option<PathBuf>,
-    path_input: String,
     current_page: usize,
     page_count: usize,
     status: String,
@@ -39,13 +45,22 @@ pub struct ComicReaderApp {
 }
 
 impl ComicReaderApp {
-    pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        creation_context: &eframe::CreationContext<'_>,
+        initial_path: Option<PathBuf>,
+    ) -> Self {
         install_system_fonts(&creation_context.egui_ctx);
 
-        Self {
-            status: "打开一个 CBZ/ZIP 漫画或图片文件夹开始阅读".to_string(),
+        let mut app = Self {
+            status: "按 O 打开 CBZ/ZIP 漫画".to_string(),
             ..Default::default()
+        };
+
+        if let Some(path) = initial_path {
+            app.open_path(path);
         }
+
+        app
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -69,6 +84,16 @@ impl ComicReaderApp {
                 self.handle = None;
                 self.status = error.to_string();
             }
+        }
+    }
+
+    fn open_file_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("打开漫画")
+            .add_filter("Comic archives", &["cbz", "zip"])
+            .pick_file()
+        {
+            self.open_path(path);
         }
     }
 
@@ -214,17 +239,8 @@ impl ComicReaderApp {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("路径");
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.path_input)
-                    .desired_width(420.0)
-                    .hint_text("/path/to/comic.cbz 或图片文件夹"),
-            );
-            let open_requested = ui.button("打开").clicked()
-                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-
-            if open_requested && !self.path_input.trim().is_empty() {
-                self.open_path(PathBuf::from(self.path_input.trim()));
+            if ui.button("打开漫画 (O)").clicked() {
+                self.open_file_dialog();
             }
 
             ui.separator();
@@ -289,6 +305,16 @@ impl ComicReaderApp {
             if let Some(handle) = &self.handle {
                 handle.next();
             }
+        }
+    }
+
+    fn handle_open_shortcut(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
+        if ctx.input(|input| input.key_pressed(egui::Key::O)) {
+            self.open_file_dialog();
         }
     }
 
@@ -385,6 +411,7 @@ impl eframe::App for ComicReaderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
+        self.handle_open_shortcut(&ctx);
         self.handle_keyboard_shortcuts(&ctx);
         self.update_thumbnail_visibility(&ctx);
         self.request_visible_thumbnails();
