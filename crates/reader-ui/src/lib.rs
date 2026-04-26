@@ -42,6 +42,11 @@ pub struct ComicReaderApp {
     thumbnails: HashMap<usize, egui::TextureHandle>,
     last_thumbnail_request: Option<(usize, usize)>,
     show_thumbnails: bool,
+    flow_center: usize,
+    flow_target: usize,
+    flow_animated: f32,
+    flow_page_input: String,
+    last_image_width: f32,
 }
 
 impl ComicReaderApp {
@@ -71,6 +76,11 @@ impl ComicReaderApp {
         self.last_thumbnail_request = None;
         self.current_page = 0;
         self.page_count = 0;
+        self.flow_center = 0;
+        self.flow_target = 0;
+        self.flow_animated = 0.0;
+        self.flow_page_input.clear();
+        self.last_image_width = 0.0;
         self.cache_status.clear();
         self.status = format!("正在打开 {}", path.display());
 
@@ -106,10 +116,12 @@ impl ComicReaderApp {
             match event {
                 ReaderEvent::PageCount { pages } => {
                     self.page_count = pages;
+                    self.flow_page_input = "1".to_string();
                     self.status = format!("共 {pages} 页");
                 }
                 ReaderEvent::CurrentPage { page_index } => {
                     self.current_page = page_index;
+                    self.set_flow_center(page_index);
                     self.status = format!("第 {} / {} 页", page_index + 1, self.page_count.max(1));
                     self.upload_nearby_textures(ctx);
                 }
@@ -211,18 +223,70 @@ impl ComicReaderApp {
             return;
         }
 
-        let request = (self.current_page, THUMB_RADIUS);
+        let request = (self.flow_center, THUMB_RADIUS);
         if self.last_thumbnail_request == Some(request) {
             return;
         }
 
-        handle.request_thumbnails(self.current_page, THUMB_RADIUS);
+        handle.request_thumbnails(self.flow_center, THUMB_RADIUS);
         self.last_thumbnail_request = Some(request);
+    }
+
+    fn set_flow_center(&mut self, page: usize) {
+        if self.page_count == 0 {
+            return;
+        }
+
+        let page = page.min(self.page_count - 1);
+        self.flow_center = page;
+        self.flow_target = page;
+        self.flow_animated = page as f32;
+        self.flow_page_input = (page + 1).to_string();
+        self.last_thumbnail_request = None;
+    }
+
+    fn set_flow_target(&mut self, page: usize) {
+        if self.page_count == 0 {
+            return;
+        }
+
+        let page = page.min(self.page_count - 1);
+        self.flow_target = page;
+        self.flow_center = page;
+        self.flow_page_input = (page + 1).to_string();
+        self.last_thumbnail_request = None;
+    }
+
+    fn update_flow_animation(&mut self, ctx: &egui::Context) {
+        let target = self.flow_target as f32;
+        let delta = target - self.flow_animated;
+        if delta.abs() < 0.01 {
+            self.flow_animated = target;
+            return;
+        }
+
+        self.flow_animated += delta * 0.22;
+        ctx.request_repaint();
+    }
+
+    fn submit_flow_page_input(&mut self) {
+        let Ok(page) = self.flow_page_input.trim().parse::<usize>() else {
+            self.flow_page_input = (self.flow_center + 1).to_string();
+            return;
+        };
+
+        let page = page
+            .saturating_sub(1)
+            .min(self.page_count.saturating_sub(1));
+        self.set_flow_target(page);
+        if let Some(handle) = &self.handle {
+            handle.go_to(page);
+        }
     }
 
     fn update_thumbnail_visibility(&mut self, ctx: &egui::Context) {
         const HOT_ZONE_HEIGHT: f32 = 36.0;
-        const HIDE_ABOVE_BOTTOM: f32 = 140.0;
+        const HIDE_ABOVE_BOTTOM: f32 = 190.0;
 
         let Some(pointer) = ctx.pointer_hover_pos() else {
             self.show_thumbnails = false;
@@ -333,6 +397,7 @@ impl ComicReaderApp {
             .map(|[width, height]| egui::vec2(*width as f32, *height as f32))
             .unwrap_or_else(|| texture.size_vec2());
         let fit = fit_size(image_size, available);
+        self.last_image_width = fit.x;
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -348,62 +413,191 @@ impl ComicReaderApp {
             return;
         }
 
-        const THUMB_RADIUS: usize = 8;
-        let start = self.current_page.saturating_sub(THUMB_RADIUS);
-        let end = (self.current_page + THUMB_RADIUS).min(self.page_count - 1);
+        const HEIGHT: f32 = 158.0;
+        const PAGE_STEP: f32 = 72.0;
+        const VISIBLE_RADIUS: isize = 6;
 
-        egui::ScrollArea::horizontal()
-            .id_salt("thumbnail-strip")
-            .max_height(92.0)
-            .show(ui, |ui| {
+        self.update_flow_animation(ui.ctx());
+
+        let available_width = ui.available_width();
+        let strip_width = if self.last_image_width > 0.0 {
+            self.last_image_width.min(available_width)
+        } else {
+            available_width
+        };
+        let (outer_rect, _) =
+            ui.allocate_exact_size(egui::vec2(available_width, HEIGHT), egui::Sense::hover());
+        let rect = egui::Rect::from_center_size(
+            outer_rect.center(),
+            egui::vec2(strip_width.max(320.0).min(available_width), HEIGHT),
+        );
+
+        let response = ui.interact(
+            rect,
+            ui.id().with("thumbnail-flow"),
+            egui::Sense::click_and_drag(),
+        );
+        if response.hovered() {
+            let scroll = ui.input(|input| input.smooth_scroll_delta().y);
+            if scroll.abs() > 0.0 {
+                let direction = if scroll < 0.0 { 1 } else { -1 };
+                let page = self
+                    .flow_target
+                    .saturating_add_signed(direction)
+                    .min(self.page_count - 1);
+                self.set_flow_target(page);
+                ui.ctx().request_repaint();
+            }
+        }
+
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(
+            rect,
+            egui::CornerRadius::same(16),
+            egui::Color32::from_rgba_premultiplied(18, 18, 22, 232),
+        );
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(16),
+            egui::Stroke::new(1.0, egui::Color32::from_gray(72)),
+            egui::StrokeKind::Outside,
+        );
+
+        let page_text = format!("{} / {}", self.current_page + 1, self.page_count);
+        painter.text(
+            rect.left_top() + egui::vec2(16.0, 13.0),
+            egui::Align2::LEFT_TOP,
+            page_text,
+            egui::FontId::proportional(17.0),
+            egui::Color32::WHITE,
+        );
+
+        let center_x = rect.center().x;
+        let base_y = rect.top() + 78.0;
+        let start = (self.flow_center as isize - VISIBLE_RADIUS).max(0) as usize;
+        let end = (self.flow_center + VISIBLE_RADIUS as usize).min(self.page_count - 1);
+
+        for page in start..=end {
+            let offset = page as f32 - self.flow_animated;
+            if offset.abs() > VISIBLE_RADIUS as f32 + 0.5 {
+                continue;
+            }
+
+            let depth = (1.0 - offset.abs() * 0.115).clamp(0.35, 1.0);
+            let selected = page == self.flow_target;
+            let max_size = egui::vec2(88.0, 112.0);
+            let size = max_size * if selected { 1.0 } else { 0.76 * depth };
+            let fold = offset.signum() * offset.abs().min(1.0) * 12.0;
+            let center = egui::pos2(center_x + offset * PAGE_STEP, base_y + offset.abs() * 10.0);
+            let thumb_rect = egui::Rect::from_center_size(center, size);
+            let shadow = thumb_rect.translate(egui::vec2(fold * 0.18, 6.0));
+
+            painter.rect_filled(
+                shadow,
+                egui::CornerRadius::same(7),
+                egui::Color32::from_rgba_premultiplied(0, 0, 0, 72),
+            );
+
+            let page_response = ui.interact(
+                thumb_rect.expand(8.0),
+                ui.id().with(("flow-page", page)),
+                egui::Sense::click(),
+            );
+            if page_response.clicked() {
+                self.set_flow_target(page);
+            }
+            if page_response.double_clicked() {
+                self.set_flow_target(page);
+                if let Some(handle) = &self.handle {
+                    handle.go_to(page);
+                }
+            }
+
+            let frame_color = if page == self.current_page {
+                ui.visuals().selection.bg_fill
+            } else if selected {
+                egui::Color32::from_rgb(120, 120, 135)
+            } else {
+                egui::Color32::from_rgb(58, 58, 66)
+            };
+            painter.rect_filled(thumb_rect, egui::CornerRadius::same(7), frame_color);
+
+            if let Some(texture) = self.thumbnails.get(&page) {
+                let image_rect = fit_rect(texture.size_vec2(), thumb_rect.shrink(4.0));
+                painter.image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE.linear_multiply(depth),
+                );
+
+                let edge_width = (fold.abs() * 0.45).max(2.0);
+                let edge_rect = if offset >= 0.0 {
+                    egui::Rect::from_min_max(
+                        image_rect.right_top() - egui::vec2(edge_width, 0.0),
+                        image_rect.right_bottom(),
+                    )
+                } else {
+                    egui::Rect::from_min_max(
+                        image_rect.left_top(),
+                        image_rect.left_bottom() + egui::vec2(edge_width, 0.0),
+                    )
+                };
+                painter.rect_filled(
+                    edge_rect,
+                    egui::CornerRadius::same(2),
+                    egui::Color32::from_rgba_premultiplied(
+                        0,
+                        0,
+                        0,
+                        (70.0 * offset.abs().min(1.0)) as u8,
+                    ),
+                );
+            } else {
+                painter.text(
+                    thumb_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}", page + 1),
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::LIGHT_GRAY,
+                );
+            }
+
+            painter.text(
+                egui::pos2(thumb_rect.center().x, rect.bottom() - 22.0),
+                egui::Align2::CENTER_CENTER,
+                format!("{}", page + 1),
+                egui::FontId::proportional(if selected { 15.0 } else { 13.0 }),
+                if selected {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::GRAY
+                },
+            );
+        }
+
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                rect.right_top() + egui::vec2(-132.0, 10.0),
+                egui::vec2(116.0, 28.0),
+            )),
+            |ui| {
                 ui.horizontal(|ui| {
-                    if start > 0 && ui.button("<<").clicked() {
-                        if let Some(handle) = &self.handle {
-                            handle.go_to(start.saturating_sub(THUMB_RADIUS));
-                        }
+                    let response = ui.add_sized(
+                        [62.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.flow_page_input)
+                            .horizontal_align(egui::Align::Center),
+                    );
+                    let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    if response.lost_focus() && enter {
+                        self.submit_flow_page_input();
                     }
-
-                    for page in start..=end {
-                        let selected = page == self.current_page;
-                        let fill = if selected {
-                            ui.visuals().selection.bg_fill
-                        } else {
-                            ui.visuals().faint_bg_color
-                        };
-
-                        egui::Frame::new()
-                            .fill(fill)
-                            .inner_margin(egui::Margin::same(3))
-                            .show(ui, |ui| {
-                                let response = if let Some(texture) = self.thumbnails.get(&page) {
-                                    let size =
-                                        fit_size(texture.size_vec2(), egui::vec2(54.0, 76.0));
-                                    ui.add(
-                                        egui::Image::new((texture.id(), size))
-                                            .sense(egui::Sense::click()),
-                                    )
-                                } else {
-                                    ui.add_sized(
-                                        [54.0, 76.0],
-                                        egui::Button::new(format!("{}", page + 1)),
-                                    )
-                                };
-
-                                if response.clicked() {
-                                    if let Some(handle) = &self.handle {
-                                        handle.go_to(page);
-                                    }
-                                }
-                            });
-                    }
-
-                    if end + 1 < self.page_count && ui.button(">>").clicked() {
-                        if let Some(handle) = &self.handle {
-                            handle.go_to((end + THUMB_RADIUS).min(self.page_count - 1));
-                        }
+                    if ui.button("跳转").clicked() {
+                        self.submit_flow_page_input();
                     }
                 });
-            });
+            },
+        );
     }
 }
 
@@ -420,12 +614,7 @@ impl eframe::App for ComicReaderApp {
             self.top_bar(ui);
             ui.separator();
 
-            let thumbnail_height = if self.show_thumbnails && self.page_count > 0 {
-                98.0
-            } else {
-                0.0
-            };
-            let image_height = (ui.available_height() - thumbnail_height - 28.0).max(0.0);
+            let image_height = (ui.available_height() - 28.0).max(0.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), image_height),
                 egui::Layout::top_down(egui::Align::Center),
@@ -435,8 +624,15 @@ impl eframe::App for ComicReaderApp {
             );
 
             if self.show_thumbnails && self.page_count > 0 {
-                ui.separator();
-                self.thumbnail_strip(ui);
+                let rect = ui.max_rect();
+                egui::Area::new(egui::Id::new("thumbnail-flow-area"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(rect.left(), rect.bottom() - 166.0))
+                    .show(&ctx, |ui| {
+                        ui.set_width(rect.width());
+                        ui.set_height(158.0);
+                        self.thumbnail_strip(ui);
+                    });
             }
 
             ui.separator();
@@ -514,6 +710,11 @@ fn fit_size(image_size: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {
 
     let scale = (available.x / image_size.x).min(available.y / image_size.y);
     image_size * scale.min(1.0)
+}
+
+fn fit_rect(image_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
+    let size = fit_size(image_size, bounds.size());
+    egui::Rect::from_center_size(bounds.center(), size)
 }
 
 fn format_bytes(bytes: usize) -> String {
