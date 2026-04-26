@@ -1,0 +1,8 @@
+---
+description: Project context for original YACReader module
+alwaysApply: true
+---
+
+# Project Context
+
+When the user refers to the "原项目", it means the YACReader reader module from `/Users/chenfeng/CLionProjects/yacreader`, which this project is rewriting in Rust.
