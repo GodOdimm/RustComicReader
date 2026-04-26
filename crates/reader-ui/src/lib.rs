@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,11 +31,14 @@ pub struct ComicReaderApp {
     status: String,
     cache_status: String,
     textures: HashMap<usize, egui::TextureHandle>,
-    current_image_size: Option<[usize; 2]>,
+    image_sizes: HashMap<usize, [usize; 2]>,
+    thumbnails: HashMap<usize, egui::TextureHandle>,
 }
 
 impl ComicReaderApp {
-    pub fn new(_creation_context: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+        install_system_fonts(&creation_context.egui_ctx);
+
         Self {
             status: "打开一个 CBZ/ZIP 漫画或图片文件夹开始阅读".to_string(),
             ..Default::default()
@@ -43,7 +47,8 @@ impl ComicReaderApp {
 
     fn open_path(&mut self, path: PathBuf) {
         self.textures.clear();
-        self.current_image_size = None;
+        self.image_sizes.clear();
+        self.thumbnails.clear();
         self.current_page = 0;
         self.page_count = 0;
         self.cache_status.clear();
@@ -88,8 +93,9 @@ impl ComicReaderApp {
                     from_cache,
                     elapsed_ms,
                 } => {
-                    let texture = texture_from_image(ctx, page_index, &image);
-                    self.current_image_size = Some([image.width as usize, image.height as usize]);
+                    let texture = texture_from_image(ctx, "page", page_index, &image);
+                    self.image_sizes
+                        .insert(page_index, [image.width as usize, image.height as usize]);
                     self.textures.insert(page_index, texture);
 
                     if page_index == self.current_page {
@@ -118,7 +124,11 @@ impl ComicReaderApp {
                 ReaderEvent::Error(error) => {
                     self.status = error;
                 }
-                ReaderEvent::Finished | ReaderEvent::ThumbnailDecoded { .. } => {}
+                ReaderEvent::ThumbnailDecoded { page_index, image } => {
+                    let texture = texture_from_image(ctx, "thumb", page_index, &image);
+                    self.thumbnails.insert(page_index, texture);
+                }
+                ReaderEvent::Finished => {}
             }
         }
     }
@@ -178,8 +188,29 @@ impl ComicReaderApp {
                     }
                 }
                 ui.label(format!("/ {}", self.page_count));
+                ui.separator();
+                ui.label("方向键左右翻页");
             }
         });
+    }
+
+    fn handle_keyboard_shortcuts(&self, ctx: &egui::Context) {
+        if self.handle.is_none() || self.page_count == 0 || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+
+        let previous = ctx.input(|input| input.key_pressed(egui::Key::ArrowLeft));
+        let next = ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
+
+        if previous && self.current_page > 0 {
+            if let Some(handle) = &self.handle {
+                handle.previous();
+            }
+        } else if next && self.current_page + 1 < self.page_count {
+            if let Some(handle) = &self.handle {
+                handle.next();
+            }
+        }
     }
 
     fn image_panel(&mut self, ui: &mut egui::Ui) {
@@ -192,8 +223,9 @@ impl ComicReaderApp {
 
         let available = ui.available_size();
         let image_size = self
-            .current_image_size
-            .map(|[width, height]| egui::vec2(width as f32, height as f32))
+            .image_sizes
+            .get(&self.current_page)
+            .map(|[width, height]| egui::vec2(*width as f32, *height as f32))
             .unwrap_or_else(|| texture.size_vec2());
         let fit = fit_size(image_size, available);
 
@@ -205,17 +237,81 @@ impl ComicReaderApp {
                 });
             });
     }
+
+    fn thumbnail_strip(&mut self, ui: &mut egui::Ui) {
+        if self.page_count == 0 {
+            return;
+        }
+
+        egui::ScrollArea::horizontal()
+            .id_salt("thumbnail-strip")
+            .max_height(92.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for page in 0..self.page_count {
+                        let selected = page == self.current_page;
+                        let fill = if selected {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            ui.visuals().faint_bg_color
+                        };
+
+                        egui::Frame::new()
+                            .fill(fill)
+                            .inner_margin(egui::Margin::same(3))
+                            .show(ui, |ui| {
+                                let response = if let Some(texture) = self.thumbnails.get(&page) {
+                                    let size =
+                                        fit_size(texture.size_vec2(), egui::vec2(54.0, 76.0));
+                                    ui.add(
+                                        egui::Image::new((texture.id(), size))
+                                            .sense(egui::Sense::click()),
+                                    )
+                                } else {
+                                    ui.add_sized(
+                                        [54.0, 76.0],
+                                        egui::Button::new(format!("{}", page + 1)),
+                                    )
+                                };
+
+                                if response.clicked() {
+                                    if let Some(handle) = &self.handle {
+                                        handle.go_to(page);
+                                    }
+                                }
+                            });
+                    }
+                });
+            });
+    }
 }
 
 impl eframe::App for ComicReaderApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_events(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.drain_events(&ctx);
+        self.handle_keyboard_shortcuts(&ctx);
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        ui.vertical(|ui| {
             self.top_bar(ui);
-        });
+            ui.separator();
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            let thumbnail_height = if self.page_count > 0 { 98.0 } else { 0.0 };
+            let image_height = (ui.available_height() - thumbnail_height - 28.0).max(0.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), image_height),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    self.image_panel(ui);
+                },
+            );
+
+            if self.page_count > 0 {
+                ui.separator();
+                self.thumbnail_strip(ui);
+            }
+
+            ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.label(&self.status);
                 if !self.cache_status.is_empty() {
@@ -229,18 +325,15 @@ impl eframe::App for ComicReaderApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.image_panel(ui);
-        });
-
         if self.handle.is_some() {
-            ctx.request_repaint();
+            ui.ctx().request_repaint();
         }
     }
 }
 
 fn texture_from_image(
     ctx: &egui::Context,
+    prefix: &str,
     page_index: usize,
     image: &DecodedImage,
 ) -> egui::TextureHandle {
@@ -250,10 +343,40 @@ fn texture_from_image(
     );
 
     ctx.load_texture(
-        format!("page-{page_index}"),
+        format!("{prefix}-{page_index}"),
         color_image,
         egui::TextureOptions::LINEAR,
     )
+}
+
+fn install_system_fonts(ctx: &egui::Context) {
+    let candidates = [
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ];
+
+    let Some(font_bytes) = candidates.iter().find_map(|path| fs::read(path).ok()) else {
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    let font_name = "system-cjk".to_string();
+    fonts.font_data.insert(
+        font_name.clone(),
+        Arc::new(egui::FontData::from_owned(font_bytes)),
+    );
+
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, font_name.clone());
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 fn fit_size(image_size: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {

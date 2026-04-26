@@ -4,6 +4,8 @@ RustComicReader 是对原项目 YACReader 阅读器模块的 Rust 重构原型�
 
 ## 运行阅读器原型
 
+项目使用 `rust-toolchain.toml` 固定到 `stable`。当前 GUI 依赖需要新版 Rust；如果本机默认还是旧工具链，进入项目目录后 Cargo 会自动使用 stable。
+
 ```shell
 cargo run -p reader-app
 ```
