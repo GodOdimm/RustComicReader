@@ -428,6 +428,8 @@ impl ComicReaderApp {
 
         const VISIBLE_RADIUS: isize = 5;
         const SIDE_THUMB_SCALE: f32 = 0.90;
+        const CENTER_SIDE_GAP_RATIO: f32 = 0.08;
+        const SIDE_STACK_STEP_RATIO: f32 = 0.35;
 
         self.update_flow_animation(ui.ctx());
 
@@ -435,7 +437,10 @@ impl ComicReaderApp {
         let height = ui.available_height().max(220.0);
         let center_thumb_height = height * 0.72;
         let center_thumb_width = center_thumb_height * 0.62;
-        let page_step = (center_thumb_width * 0.56).clamp(72.0, 132.0);
+        let side_thumb_width = center_thumb_width * SIDE_THUMB_SCALE;
+        let center_side_step = (center_thumb_width + side_thumb_width) * 0.5
+            + center_thumb_width * CENTER_SIDE_GAP_RATIO;
+        let side_stack_step = side_thumb_width * SIDE_STACK_STEP_RATIO;
         let strip_width = if self.last_image_width > 0.0 {
             self.last_image_width.min(available_width)
         } else {
@@ -516,7 +521,13 @@ impl ComicReaderApp {
                 max_size * SIDE_THUMB_SCALE
             };
             let fold = offset.signum() * abs_offset.min(1.0) * center_thumb_width * 0.20;
-            let center = egui::pos2(center_x + offset * page_step, base_y + abs_offset * 11.0);
+            let x_distance = if abs_offset <= 1.0 {
+                center_side_step * abs_offset
+            } else {
+                center_side_step + (abs_offset - 1.0) * side_stack_step
+            };
+            let y_offset = abs_offset.min(1.0) * center_thumb_height * 0.08;
+            let center = egui::pos2(center_x + offset.signum() * x_distance, base_y + y_offset);
             let thumb_rect = egui::Rect::from_center_size(center, size);
             let shadow = thumb_rect.translate(egui::vec2(fold * 0.18, 6.0));
 
