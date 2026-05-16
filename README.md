@@ -1,6 +1,6 @@
 # RustComicReader
 
-RustComicReader 是对原项目 YACReader 阅读器模块的 Rust 重构原型，当前重点是验证高性能漫画阅读管线：按条目读取 CBZ/ZIP、当前页优先、后台解码、固定窗口缓存和 egui/wgpu 显示。
+RustComicReader 是对项目 [YACReader](https://github.com/YACReader) 阅读器模块的 Rust 重构原型，当前重点是验证高性能漫画阅读管线：按条目读取 CBZ/ZIP、当前页优先、后台解码、固定窗口缓存和 egui/wgpu 显示。
 
 ## 运行阅读器原型
 
