@@ -26,6 +26,22 @@ cargo run --release -p reader-app --bin bench_reader -- /path/to/100mb-comic.cbz
 
 压测会输出首屏、邻近页、远距离跳页耗时，并打印缓存占用。
 
+## 本地打包 macOS DMG
+
+项目提供本地使用的 unsigned DMG 打包脚本。脚本会运行测试、生成 release `.app`、做 ad-hoc 签名，并输出 DMG：
+
+```shell
+./scripts/package-macos.sh
+```
+
+输出文件位于：
+
+```shell
+dist/RustComicReader-1.0.0-macos.dmg
+```
+
+这个 DMG 适合个人本机使用；如果要公开分发，需要再使用 Apple Developer ID 证书签名并提交 Apple notarization。
+
 ## Workspace 结构
 
 - `crates/reader-core`：阅读器核心 trait、页面排序、LRU 缓存、后台调度和事件流。
