@@ -129,6 +129,40 @@ impl ComicReaderApp {
         }
     }
 
+    fn save_current_page_dialog(&mut self) {
+        let Some(image) = self.decoded_images.get(&self.current_page) else {
+            self.status = "当前页还未加载完成，无法保存".to_string();
+            return;
+        };
+
+        let default_name = format!("page-{:04}.png", self.current_page + 1);
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("保存当前页")
+            .add_filter("PNG image", &["png"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+
+        let path = ensure_png_extension(path);
+        match image::save_buffer_with_format(
+            &path,
+            &image.rgba,
+            image.width,
+            image.height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        ) {
+            Ok(()) => {
+                self.status = format!("已保存当前页到 {}", path.display());
+            }
+            Err(error) => {
+                self.status = format!("保存当前页失败: {error}");
+            }
+        }
+    }
+
     fn drain_events(&mut self, ctx: &egui::Context) {
         let Some(handle) = self.handle.clone() else {
             return;
@@ -427,13 +461,14 @@ impl ComicReaderApp {
         });
     }
 
-    fn handle_keyboard_shortcuts(&self, ctx: &egui::Context) {
+    fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
         if self.handle.is_none() || self.page_count == 0 || ctx.egui_wants_keyboard_input() {
             return;
         }
 
         let previous = ctx.input(|input| input.key_pressed(egui::Key::ArrowLeft));
         let next = ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
+        let save = ctx.input(|input| input.key_pressed(egui::Key::S));
 
         if previous && self.current_page > 0 {
             if let Some(handle) = &self.handle {
@@ -443,6 +478,8 @@ impl ComicReaderApp {
             if let Some(handle) = &self.handle {
                 handle.next();
             }
+        } else if save {
+            self.save_current_page_dialog();
         }
     }
 
@@ -474,11 +511,22 @@ impl ComicReaderApp {
         self.last_image_width = fit.x;
         self.last_image_height = fit.y;
 
+        let texture_id = texture.id();
+
+        let panel_response = ui.interact(
+            ui.max_rect(),
+            ui.id().with("image-panel-context-menu"),
+            egui::Sense::click(),
+        );
+        page_actions_context_menu(panel_response, self);
+
         egui::ScrollArea::both()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add(egui::Image::new((texture.id(), fit)));
+                    let response =
+                        ui.add(egui::Image::new((texture_id, fit)).sense(egui::Sense::click()));
+                    page_actions_context_menu(response, self);
                 });
             });
     }
@@ -776,6 +824,23 @@ fn texture_from_image(
     )
 }
 
+fn page_actions_context_menu(response: egui::Response, app: &mut ComicReaderApp) {
+    response.context_menu(|ui| {
+        if ui.button("Save").clicked() {
+            app.save_current_page_dialog();
+            ui.close();
+        }
+    });
+}
+
+fn ensure_png_extension(mut path: PathBuf) -> PathBuf {
+    if path.extension().is_none() {
+        path.set_extension("png");
+    }
+
+    path
+}
+
 fn install_system_fonts(ctx: &egui::Context) {
     let candidates = [
         "/System/Library/Fonts/PingFang.ttc",
@@ -1037,5 +1102,17 @@ mod tests {
         let entries = parse_progress_entries(&contents);
 
         assert_eq!(entries.get(key), Some(&42));
+    }
+
+    #[test]
+    fn save_path_defaults_to_png_extension() {
+        assert_eq!(
+            ensure_png_extension(PathBuf::from("/tmp/page-0001")),
+            PathBuf::from("/tmp/page-0001.png")
+        );
+        assert_eq!(
+            ensure_png_extension(PathBuf::from("/tmp/page-0001.png")),
+            PathBuf::from("/tmp/page-0001.png")
+        );
     }
 }
