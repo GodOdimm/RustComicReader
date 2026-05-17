@@ -8,6 +8,8 @@ use eframe::egui;
 use image_pipeline::ImageCrateDecoder;
 use reader_core::{spawn_reader, DecodedImage, ReaderEvent, ReaderHandle, ReaderOptions};
 
+const READING_PROGRESS_PATH: &str = "meta/reading_progress.tsv";
+
 pub fn run(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -32,6 +34,7 @@ pub fn run(initial_path: Option<PathBuf>) -> eframe::Result<()> {
 pub struct ComicReaderApp {
     handle: Option<ReaderHandle>,
     current_path: Option<PathBuf>,
+    current_progress_key: Option<String>,
     current_page: usize,
     page_count: usize,
     status: String,
@@ -48,6 +51,9 @@ pub struct ComicReaderApp {
     flow_page_input: String,
     last_image_width: f32,
     last_image_height: f32,
+    pending_resume_page: Option<usize>,
+    awaiting_resume_page: Option<usize>,
+    progress_store: ReadingProgressStore,
 }
 
 impl ComicReaderApp {
@@ -70,6 +76,9 @@ impl ComicReaderApp {
     }
 
     fn open_path(&mut self, path: PathBuf) {
+        let progress_key = progress_key_for_path(&path);
+        let resume_page = self.progress_store.page_for_key(&progress_key);
+
         self.textures.clear();
         self.decoded_images.clear();
         self.image_sizes.clear();
@@ -84,6 +93,8 @@ impl ComicReaderApp {
         self.last_image_width = 0.0;
         self.last_image_height = 0.0;
         self.cache_status.clear();
+        self.pending_resume_page = resume_page;
+        self.awaiting_resume_page = None;
         self.status = format!("正在打开 {}", path.display());
 
         match backend_for_path(&path) {
@@ -91,9 +102,13 @@ impl ComicReaderApp {
                 let decoder = Arc::new(ImageCrateDecoder::new());
                 self.handle = Some(spawn_reader(backend, decoder, ReaderOptions::default()));
                 self.current_path = Some(path);
+                self.current_progress_key = Some(progress_key);
             }
             Err(error) => {
                 self.handle = None;
+                self.current_path = None;
+                self.current_progress_key = None;
+                self.pending_resume_page = None;
                 self.status = error.to_string();
             }
         }
@@ -120,12 +135,14 @@ impl ComicReaderApp {
                     self.page_count = pages;
                     self.flow_page_input = "1".to_string();
                     self.status = format!("共 {pages} 页");
+                    self.resume_saved_page_if_needed(&handle);
                 }
                 ReaderEvent::CurrentPage { page_index } => {
                     self.current_page = page_index;
                     self.set_flow_center(page_index);
                     self.status = format!("第 {} / {} 页", page_index + 1, self.page_count.max(1));
                     self.upload_nearby_textures(ctx);
+                    self.save_progress_if_current_page_is_settled(page_index);
                 }
                 ReaderEvent::LoadingPage { page_index } => {
                     if page_index == self.current_page {
@@ -257,6 +274,46 @@ impl ComicReaderApp {
         self.flow_center = page;
         self.flow_page_input = (page + 1).to_string();
         self.last_thumbnail_request = None;
+    }
+
+    fn resume_saved_page_if_needed(&mut self, handle: &ReaderHandle) {
+        if self.page_count == 0 {
+            self.pending_resume_page = None;
+            self.awaiting_resume_page = None;
+            return;
+        }
+
+        let Some(saved_page) = self.pending_resume_page.take() else {
+            return;
+        };
+
+        let page = saved_page.min(self.page_count - 1);
+        if page == 0 {
+            return;
+        }
+
+        self.awaiting_resume_page = Some(page);
+        self.status = format!("继续阅读第 {} / {} 页", page + 1, self.page_count);
+        handle.go_to(page);
+    }
+
+    fn save_progress_if_current_page_is_settled(&mut self, page_index: usize) {
+        if self
+            .awaiting_resume_page
+            .is_some_and(|resume| page_index != resume)
+        {
+            return;
+        }
+
+        self.awaiting_resume_page = None;
+
+        let Some(key) = &self.current_progress_key else {
+            return;
+        };
+
+        if let Err(error) = self.progress_store.save_page(key, page_index) {
+            self.status = format!("阅读进度保存失败: {error}");
+        }
     }
 
     fn update_flow_animation(&mut self, ctx: &egui::Context) {
@@ -744,6 +801,118 @@ fn install_system_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+#[derive(Debug, Clone)]
+struct ReadingProgressStore {
+    path: PathBuf,
+    pages_by_key: HashMap<String, usize>,
+}
+
+impl Default for ReadingProgressStore {
+    fn default() -> Self {
+        Self::load(PathBuf::from(READING_PROGRESS_PATH))
+    }
+}
+
+impl ReadingProgressStore {
+    fn load(path: PathBuf) -> Self {
+        let pages_by_key = fs::read_to_string(&path)
+            .ok()
+            .map(|contents| parse_progress_entries(&contents))
+            .unwrap_or_default();
+
+        Self { path, pages_by_key }
+    }
+
+    fn page_for_key(&self, key: &str) -> Option<usize> {
+        self.pages_by_key.get(key).copied()
+    }
+
+    fn save_page(&mut self, key: &str, page: usize) -> std::io::Result<()> {
+        self.pages_by_key.insert(key.to_string(), page);
+        self.flush()
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut entries: Vec<_> = self.pages_by_key.iter().collect();
+        entries.sort_by_key(|(key, _)| *key);
+
+        let mut contents =
+            String::from("# RustComicReader reading progress\n# path\tzero_based_page\n");
+        for (key, page) in entries {
+            contents.push_str(&escape_progress_key(key));
+            contents.push('\t');
+            contents.push_str(&page.to_string());
+            contents.push('\n');
+        }
+
+        fs::write(&self.path, contents)
+    }
+}
+
+fn progress_key_for_path(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn parse_progress_entries(contents: &str) -> HashMap<String, usize> {
+    let mut entries = HashMap::new();
+
+    for line in contents.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, page)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(page) = page.parse::<usize>() else {
+            continue;
+        };
+
+        entries.insert(unescape_progress_key(key), page);
+    }
+
+    entries
+}
+
+fn escape_progress_key(key: &str) -> String {
+    key.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+}
+
+fn unescape_progress_key(key: &str) -> String {
+    let mut output = String::with_capacity(key.len());
+    let mut chars = key.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('\\') => output.push('\\'),
+            Some('t') => output.push('\t'),
+            Some('n') => output.push('\n'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+
+    output
+}
+
 fn fit_size(image_size: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {
     if image_size.x <= 0.0 || image_size.y <= 0.0 || available.x <= 0.0 || available.y <= 0.0 {
         return image_size;
@@ -849,4 +1018,19 @@ fn is_supported_open_path(path: &Path) -> bool {
                 .as_deref(),
             Some("cbz" | "zip")
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_entries_round_trip_escaped_paths() {
+        let key = "/tmp/comics/tab\tand\\newline\ncomic.cbz";
+        let contents = format!("{}\t42\n", escape_progress_key(key));
+
+        let entries = parse_progress_entries(&contents);
+
+        assert_eq!(entries.get(key), Some(&42));
+    }
 }
