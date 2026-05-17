@@ -13,7 +13,6 @@ const READING_PROGRESS_PATH: &str = "meta/reading_progress.tsv";
 pub fn run(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 900.0])
             .with_fullscreen(true)
             .with_icon(app_icon()),
         ..Default::default()
