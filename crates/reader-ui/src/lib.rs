@@ -1165,9 +1165,79 @@ fn texture_from_image(
 
 fn page_actions_context_menu(response: egui::Response, app: &mut ComicReaderApp) {
     response.context_menu(|ui| {
-        if ui.button("Save").clicked() {
+        const MENU_TEXT_SIZE: f32 = 18.0;
+
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+
+        if ui
+            .button(egui::RichText::new("保存当前页 (S)").size(MENU_TEXT_SIZE))
+            .clicked()
+        {
             app.save_current_page_dialog();
             ui.close();
+        }
+
+        let mode_label = if app.manhwa_mode {
+            "退出韩漫模式 (H)"
+        } else {
+            "进入韩漫模式 (H)"
+        };
+        if ui
+            .button(egui::RichText::new(mode_label).size(MENU_TEXT_SIZE))
+            .clicked()
+        {
+            app.manhwa_mode = !app.manhwa_mode;
+            app.pending_manhwa_page_turn = None;
+            if app.manhwa_mode {
+                app.manhwa_zoom = 1.0;
+                app.manhwa_scroll_offset = 0.0;
+                app.upload_nearby_textures(ui.ctx());
+                app.request_manhwa_pages();
+                app.status = "韩漫模式：上下方向键滚动，Cmd +/- 缩放，H 返回普通模式".to_string();
+            } else {
+                app.status = format!("第 {} / {} 页", app.current_page + 1, app.page_count);
+            }
+            ui.ctx().request_repaint();
+            ui.close();
+        }
+
+        if app.manhwa_mode {
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!("韩漫缩放 {:.0}%", app.manhwa_zoom * 100.0))
+                    .size(MENU_TEXT_SIZE),
+            );
+
+            if ui
+                .add_enabled(
+                    app.manhwa_zoom < MANHWA_MAX_ZOOM,
+                    egui::Button::new(
+                        egui::RichText::new("放大 10% (⌘ + `+`)").size(MENU_TEXT_SIZE),
+                    ),
+                )
+                .clicked()
+            {
+                app.adjust_manhwa_zoom(MANHWA_ZOOM_STEP);
+                app.request_manhwa_pages();
+                ui.ctx().request_repaint();
+                ui.close();
+            }
+
+            if ui
+                .add_enabled(
+                    app.manhwa_zoom > MANHWA_MIN_ZOOM,
+                    egui::Button::new(
+                        egui::RichText::new("缩小 10% (⌘ + `-`)").size(MENU_TEXT_SIZE),
+                    ),
+                )
+                .clicked()
+            {
+                app.adjust_manhwa_zoom(-MANHWA_ZOOM_STEP);
+                app.request_manhwa_pages();
+                ui.ctx().request_repaint();
+                ui.close();
+            }
         }
     });
 }
