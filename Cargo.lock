@@ -2034,6 +2034,7 @@ version = "0.1.0"
 dependencies = [
  "archive",
  "eframe",
+ "image 0.25.6",
  "image-pipeline",
  "reader-core",
  "rfd",
