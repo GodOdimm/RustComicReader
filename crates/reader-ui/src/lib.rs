@@ -75,7 +75,6 @@ pub struct ComicReaderApp {
 }
 
 struct ManhwaPageLayout {
-    index: usize,
     texture_id: egui::TextureId,
     top: f32,
     size: egui::Vec2,
@@ -532,11 +531,13 @@ impl ComicReaderApp {
             let scroll_down = ctx.input(|input| input.key_down(egui::Key::ArrowDown));
 
             if zoom_in {
-                self.manhwa_zoom = (self.manhwa_zoom + MANHWA_ZOOM_STEP).min(MANHWA_MAX_ZOOM);
+                self.adjust_manhwa_zoom(MANHWA_ZOOM_STEP);
+                self.request_manhwa_pages();
                 ctx.request_repaint();
             }
             if zoom_out {
-                self.manhwa_zoom = (self.manhwa_zoom - MANHWA_ZOOM_STEP).max(MANHWA_MIN_ZOOM);
+                self.adjust_manhwa_zoom(-MANHWA_ZOOM_STEP);
+                self.request_manhwa_pages();
                 ctx.request_repaint();
             }
             if scroll_up {
@@ -679,18 +680,18 @@ impl ComicReaderApp {
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
-
-            if page.index + 1 < self.page_count {
-                let boundary_y = image_rect.bottom() + MANHWA_PAGE_GAP * 0.5;
-                painter.line_segment(
-                    [
-                        egui::pos2(image_rect.left(), boundary_y),
-                        egui::pos2(image_rect.right(), boundary_y),
-                    ],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(72)),
-                );
-            }
         }
+    }
+
+    fn adjust_manhwa_zoom(&mut self, delta: f32) {
+        let old_zoom = self.manhwa_zoom;
+        let new_zoom = (self.manhwa_zoom + delta).clamp(MANHWA_MIN_ZOOM, MANHWA_MAX_ZOOM);
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON {
+            return;
+        }
+
+        self.manhwa_zoom = new_zoom;
+        self.manhwa_scroll_offset *= new_zoom / old_zoom;
     }
 
     fn normalize_manhwa_scroll(&mut self, ctx: &egui::Context, base_width: f32) {
@@ -776,7 +777,6 @@ impl ComicReaderApp {
                 break;
             };
             pages.push(ManhwaPageLayout {
-                index: page,
                 texture_id: texture.id(),
                 top,
                 size,
