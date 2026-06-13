@@ -17,7 +17,7 @@ const MANHWA_MIN_ZOOM: f32 = 0.40;
 const MANHWA_MAX_ZOOM: f32 = 3.00;
 const MANHWA_ZOOM_STEP: f32 = 0.10;
 const MANHWA_WHEEL_SCROLL_SENSITIVITY: f32 = 0.65;
-const MANHWA_PAGE_GAP: f32 = 18.0;
+const MANHWA_PAGE_GAP: f32 = 0.0;
 
 pub fn run(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
