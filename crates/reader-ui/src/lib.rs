@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use eframe::egui;
 use image_pipeline::ImageCrateDecoder;
 use reader_core::{spawn_reader, DecodedImage, ReaderEvent, ReaderHandle, ReaderOptions};
 
-const READING_PROGRESS_PATH: &str = "meta/reading_progress.tsv";
+const LEGACY_READING_PROGRESS_PATH: &str = "meta/reading_progress.tsv";
 
 pub fn run(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -879,16 +880,24 @@ struct ReadingProgressStore {
 
 impl Default for ReadingProgressStore {
     fn default() -> Self {
-        Self::load(PathBuf::from(READING_PROGRESS_PATH))
+        Self::load(default_reading_progress_path())
     }
 }
 
 impl ReadingProgressStore {
     fn load(path: PathBuf) -> Self {
-        let pages_by_key = fs::read_to_string(&path)
+        let mut pages_by_key = fs::read_to_string(&path)
             .ok()
             .map(|contents| parse_progress_entries(&contents))
             .unwrap_or_default();
+
+        if pages_by_key.is_empty() {
+            let legacy_path = PathBuf::from(LEGACY_READING_PROGRESS_PATH);
+            pages_by_key = fs::read_to_string(&legacy_path)
+                .ok()
+                .map(|contents| parse_progress_entries(&contents))
+                .unwrap_or_default();
+        }
 
         Self { path, pages_by_key }
     }
@@ -921,6 +930,18 @@ impl ReadingProgressStore {
 
         fs::write(&self.path, contents)
     }
+}
+
+fn default_reading_progress_path() -> PathBuf {
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("RustComicReader")
+            .join("reading_progress.tsv");
+    }
+
+    PathBuf::from(LEGACY_READING_PROGRESS_PATH)
 }
 
 fn progress_key_for_path(path: &Path) -> String {
@@ -1093,6 +1114,7 @@ fn is_supported_open_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn progress_entries_round_trip_escaped_paths() {
@@ -1114,5 +1136,24 @@ mod tests {
             ensure_png_extension(PathBuf::from("/tmp/page-0001.png")),
             PathBuf::from("/tmp/page-0001.png")
         );
+    }
+
+    #[test]
+    fn progress_store_flushes_loaded_entries_to_configured_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let path = env::temp_dir()
+            .join("rustcomicreader-tests")
+            .join(format!("reading-progress-{unique}.tsv"));
+
+        let mut store = ReadingProgressStore::load(path.clone());
+        store
+            .save_page("/tmp/comic.cbz", 7)
+            .expect("progress should save to configured path");
+
+        let contents = fs::read_to_string(&path).expect("progress file should exist");
+        assert!(contents.contains("/tmp/comic.cbz\t7"));
     }
 }
