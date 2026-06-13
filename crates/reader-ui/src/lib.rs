@@ -18,6 +18,7 @@ const MANHWA_MAX_ZOOM: f32 = 3.00;
 const MANHWA_ZOOM_STEP: f32 = 0.10;
 const MANHWA_WHEEL_SCROLL_SENSITIVITY: f32 = 0.65;
 const MANHWA_PAGE_GAP: f32 = 0.0;
+const MANHWA_LOOKAHEAD_PAGES: usize = 3;
 
 pub fn run(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -78,6 +79,12 @@ struct ManhwaPageLayout {
     texture_id: egui::TextureId,
     top: f32,
     size: egui::Vec2,
+}
+
+struct ManhwaScrollBounds {
+    min: f32,
+    max: f32,
+    total_height: f32,
 }
 
 impl ComicReaderApp {
@@ -286,7 +293,8 @@ impl ComicReaderApp {
 
     fn should_keep_texture(&self, page_index: usize) -> bool {
         if self.manhwa_mode {
-            page_index >= self.current_page.saturating_sub(1) && page_index <= self.current_page + 2
+            page_index >= self.current_page.saturating_sub(1)
+                && page_index <= self.current_page + MANHWA_LOOKAHEAD_PAGES
         } else {
             self.current_page.abs_diff(page_index) <= 1
         }
@@ -294,7 +302,11 @@ impl ComicReaderApp {
 
     fn texture_window(&self) -> impl Iterator<Item = usize> {
         let start = self.current_page.saturating_sub(1);
-        let lookahead = if self.manhwa_mode { 2 } else { 1 };
+        let lookahead = if self.manhwa_mode {
+            MANHWA_LOOKAHEAD_PAGES
+        } else {
+            1
+        };
         let end = (self.current_page + lookahead).min(self.page_count.saturating_sub(1));
         start..=end
     }
@@ -302,8 +314,9 @@ impl ComicReaderApp {
     fn trim_page_textures(&mut self) {
         let current = self.current_page;
         if self.manhwa_mode {
-            self.textures
-                .retain(|page, _| *page >= current.saturating_sub(1) && *page <= current + 2);
+            self.textures.retain(|page, _| {
+                *page >= current.saturating_sub(1) && *page <= current + MANHWA_LOOKAHEAD_PAGES
+            });
         } else {
             self.textures.retain(|page, _| current.abs_diff(*page) <= 1);
         }
@@ -511,6 +524,8 @@ impl ComicReaderApp {
                 self.manhwa_zoom = 1.0;
                 self.manhwa_scroll_offset = 0.0;
                 self.pending_manhwa_page_turn = None;
+                self.upload_nearby_textures(ctx);
+                self.request_manhwa_pages();
                 self.status = "韩漫模式：上下方向键滚动，Cmd +/- 缩放，H 返回普通模式".to_string();
             } else {
                 self.pending_manhwa_page_turn = None;
@@ -656,14 +671,10 @@ impl ComicReaderApp {
         self.request_manhwa_pages();
 
         let pages = self.manhwa_visible_pages(base_width);
-        let total_height = pages
-            .last()
-            .map(|page| page.top + page.size.y)
-            .unwrap_or(rect.height());
-        let max_scroll = (total_height - rect.height()).max(0.0);
-        self.manhwa_scroll_offset = self.manhwa_scroll_offset.clamp(0.0, max_scroll);
+        let bounds = self.manhwa_scroll_bounds(base_width, rect.height());
+        self.manhwa_scroll_offset = self.manhwa_scroll_offset.clamp(bounds.min, bounds.max);
         self.last_image_width = base_width * self.manhwa_zoom;
-        self.last_image_height = rect.height().min(total_height);
+        self.last_image_height = rect.height().min(bounds.total_height);
 
         let painter = ui.painter().with_clip_rect(rect);
         for page in pages {
@@ -728,7 +739,6 @@ impl ComicReaderApp {
                 break;
             }
             if !self.textures.contains_key(&(self.current_page + 1)) {
-                self.manhwa_scroll_offset = current_extent.min(self.manhwa_scroll_offset);
                 break;
             }
 
@@ -750,7 +760,7 @@ impl ComicReaderApp {
         }
 
         let start = self.current_page.saturating_sub(1);
-        let end = (self.current_page + 3).min(self.page_count - 1);
+        let end = (self.current_page + MANHWA_LOOKAHEAD_PAGES).min(self.page_count - 1);
         handle.request_pages((start..=end).collect());
     }
 
@@ -767,14 +777,34 @@ impl ComicReaderApp {
 
     fn manhwa_visible_pages(&self, base_width: f32) -> Vec<ManhwaPageLayout> {
         let mut pages = Vec::new();
-        let mut top = 0.0;
 
-        for page in self.current_page..self.page_count.min(self.current_page + 3) {
+        if self.current_page > 0 {
+            let previous_page = self.current_page - 1;
+            if let (Some(texture), Some(size)) = (
+                self.textures.get(&previous_page),
+                self.manhwa_display_size(previous_page, base_width),
+            ) {
+                pages.push(ManhwaPageLayout {
+                    texture_id: texture.id(),
+                    top: -(size.y + MANHWA_PAGE_GAP),
+                    size,
+                });
+            }
+        }
+
+        let mut top = 0.0;
+        for page in self.current_page
+            ..self
+                .page_count
+                .min(self.current_page + MANHWA_LOOKAHEAD_PAGES + 1)
+        {
             let Some(texture) = self.textures.get(&page) else {
-                break;
+                top += self.estimated_manhwa_display_height(base_width) + MANHWA_PAGE_GAP;
+                continue;
             };
             let Some(size) = self.manhwa_display_size(page, base_width) else {
-                break;
+                top += self.estimated_manhwa_display_height(base_width) + MANHWA_PAGE_GAP;
+                continue;
             };
             pages.push(ManhwaPageLayout {
                 texture_id: texture.id(),
@@ -785,6 +815,45 @@ impl ComicReaderApp {
         }
 
         pages
+    }
+
+    fn manhwa_scroll_bounds(&self, base_width: f32, viewport_height: f32) -> ManhwaScrollBounds {
+        let previous_extent = if self.current_page > 0 {
+            self.manhwa_display_size(self.current_page - 1, base_width)
+                .map(|size| size.y)
+                .unwrap_or_else(|| self.estimated_manhwa_display_height(base_width))
+                + MANHWA_PAGE_GAP
+        } else {
+            0.0
+        };
+
+        let mut total_height = 0.0;
+        for page in self.current_page
+            ..self
+                .page_count
+                .min(self.current_page + MANHWA_LOOKAHEAD_PAGES + 1)
+        {
+            let height = self
+                .manhwa_display_size(page, base_width)
+                .map(|size| size.y)
+                .unwrap_or_else(|| self.estimated_manhwa_display_height(base_width));
+            total_height += height;
+            if page + 1 < self.page_count {
+                total_height += MANHWA_PAGE_GAP;
+            }
+        }
+
+        ManhwaScrollBounds {
+            min: -previous_extent,
+            max: (total_height - viewport_height).max(0.0),
+            total_height,
+        }
+    }
+
+    fn estimated_manhwa_display_height(&self, base_width: f32) -> f32 {
+        self.manhwa_display_size(self.current_page, base_width)
+            .map(|size| size.y)
+            .unwrap_or(base_width * self.manhwa_zoom * 1.5)
     }
 
     fn manhwa_display_size(&self, page: usize, base_width: f32) -> Option<egui::Vec2> {
