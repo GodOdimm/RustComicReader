@@ -272,6 +272,7 @@ pub enum ReaderCommand {
     GoTo(PageIndex),
     Next,
     Previous,
+    RequestPages(Vec<PageIndex>),
     RequestThumbnails { center: PageIndex, radius: usize },
     Shutdown,
 }
@@ -329,6 +330,10 @@ impl ReaderHandle {
         let _ = self
             .command_tx
             .send(ReaderCommand::RequestThumbnails { center, radius });
+    }
+
+    pub fn request_pages(&self, pages: Vec<PageIndex>) {
+        let _ = self.command_tx.send(ReaderCommand::RequestPages(pages));
     }
 
     pub fn shutdown(&self) {
@@ -609,6 +614,9 @@ impl ReaderWorker {
                 Ok(ReaderCommand::GoTo(page)) => latest = Some(page.min(page_count - 1)),
                 Ok(ReaderCommand::Next) => latest = Some((current + 1).min(page_count - 1)),
                 Ok(ReaderCommand::Previous) => latest = Some(current.saturating_sub(1)),
+                Ok(ReaderCommand::RequestPages(pages)) => {
+                    self.enqueue_prefetch_pages(pages, page_count);
+                }
                 Ok(ReaderCommand::RequestThumbnails { center, radius }) => {
                     self.enqueue_thumbnails(center, radius, page_count);
                 }
@@ -649,6 +657,10 @@ impl ReaderWorker {
             ReaderCommand::GoTo(page) => Some(WindowResult::JumpTo(page.min(page_count - 1))),
             ReaderCommand::Next => Some(WindowResult::JumpTo((current + 1).min(page_count - 1))),
             ReaderCommand::Previous => Some(WindowResult::JumpTo(current.saturating_sub(1))),
+            ReaderCommand::RequestPages(pages) => {
+                self.enqueue_prefetch_pages(pages, page_count);
+                Some(WindowResult::Continue)
+            }
             ReaderCommand::RequestThumbnails { center, radius } => {
                 self.enqueue_thumbnails(center, radius, page_count);
                 Some(WindowResult::Continue)
@@ -683,6 +695,19 @@ impl ReaderWorker {
 
     fn emit_error(&self, error: ReaderError) {
         let _ = self.event_tx.send(ReaderEvent::Error(error.to_string()));
+    }
+
+    fn enqueue_prefetch_pages(&mut self, pages: Vec<PageIndex>, page_count: usize) {
+        for page in pages.into_iter().rev() {
+            if page >= page_count
+                || self.display_cache.contains(page)
+                || self.prefetch_queue.contains(&page)
+            {
+                continue;
+            }
+
+            self.prefetch_queue.push_front(page);
+        }
     }
 }
 

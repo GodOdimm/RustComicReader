@@ -17,7 +17,7 @@ const MANHWA_MIN_ZOOM: f32 = 0.40;
 const MANHWA_MAX_ZOOM: f32 = 3.00;
 const MANHWA_ZOOM_STEP: f32 = 0.10;
 const MANHWA_WHEEL_SCROLL_SENSITIVITY: f32 = 0.65;
-const MANHWA_PAGE_TURN_OVERSCROLL: f32 = 48.0;
+const MANHWA_PAGE_GAP: f32 = 18.0;
 
 pub fn run(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -72,6 +72,13 @@ pub struct ComicReaderApp {
     pending_resume_page: Option<usize>,
     awaiting_resume_page: Option<usize>,
     progress_store: ReadingProgressStore,
+}
+
+struct ManhwaPageLayout {
+    index: usize,
+    texture_id: egui::TextureId,
+    top: f32,
+    size: egui::Vec2,
 }
 
 impl ComicReaderApp {
@@ -196,8 +203,12 @@ impl ComicReaderApp {
                 ReaderEvent::CurrentPage { page_index } => {
                     self.current_page = page_index;
                     self.set_flow_center(page_index);
-                    self.manhwa_scroll_offset = 0.0;
-                    self.pending_manhwa_page_turn = None;
+                    if self.pending_manhwa_page_turn == Some(page_index) {
+                        self.pending_manhwa_page_turn = None;
+                    } else {
+                        self.manhwa_scroll_offset = 0.0;
+                        self.pending_manhwa_page_turn = None;
+                    }
                     self.status = format!("第 {} / {} 页", page_index + 1, self.page_count.max(1));
                     self.upload_nearby_textures(ctx);
                     self.save_progress_if_current_page_is_settled(page_index);
@@ -275,18 +286,28 @@ impl ComicReaderApp {
     }
 
     fn should_keep_texture(&self, page_index: usize) -> bool {
-        self.current_page.abs_diff(page_index) <= 1
+        if self.manhwa_mode {
+            page_index >= self.current_page.saturating_sub(1) && page_index <= self.current_page + 2
+        } else {
+            self.current_page.abs_diff(page_index) <= 1
+        }
     }
 
     fn texture_window(&self) -> impl Iterator<Item = usize> {
         let start = self.current_page.saturating_sub(1);
-        let end = (self.current_page + 1).min(self.page_count.saturating_sub(1));
+        let lookahead = if self.manhwa_mode { 2 } else { 1 };
+        let end = (self.current_page + lookahead).min(self.page_count.saturating_sub(1));
         start..=end
     }
 
     fn trim_page_textures(&mut self) {
         let current = self.current_page;
-        self.textures.retain(|page, _| current.abs_diff(*page) <= 1);
+        if self.manhwa_mode {
+            self.textures
+                .retain(|page, _| *page >= current.saturating_sub(1) && *page <= current + 2);
+        } else {
+            self.textures.retain(|page, _| current.abs_diff(*page) <= 1);
+        }
     }
 
     fn request_visible_thumbnails(&mut self) {
@@ -561,6 +582,13 @@ impl ComicReaderApp {
     }
 
     fn image_panel(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_size();
+
+        if self.manhwa_mode {
+            self.manhwa_image_panel(ui, available);
+            return;
+        }
+
         let Some(texture) = self.textures.get(&self.current_page) else {
             ui.centered_and_justified(|ui| {
                 ui.label(&self.status);
@@ -568,7 +596,6 @@ impl ComicReaderApp {
             return;
         };
 
-        let available = ui.available_size();
         let image_size = self
             .image_sizes
             .get(&self.current_page)
@@ -582,11 +609,6 @@ impl ComicReaderApp {
             egui::Sense::click(),
         );
         page_actions_context_menu(panel_response, self);
-
-        if self.manhwa_mode {
-            self.manhwa_image_panel(ui, texture_id, image_size, available);
-            return;
-        }
 
         let fit = fit_size(image_size, available);
         self.last_image_width = fit.x;
@@ -603,79 +625,180 @@ impl ComicReaderApp {
             });
     }
 
-    fn manhwa_image_panel(
-        &mut self,
-        ui: &mut egui::Ui,
-        texture_id: egui::TextureId,
-        image_size: egui::Vec2,
-        available: egui::Vec2,
-    ) {
+    fn manhwa_image_panel(&mut self, ui: &mut egui::Ui, available: egui::Vec2) {
+        if !self.textures.contains_key(&self.current_page) {
+            ui.centered_and_justified(|ui| {
+                ui.label(&self.status);
+            });
+            return;
+        }
+
         let panel_size = egui::vec2(available.x.max(1.0), available.y.max(1.0));
         let (rect, response) = ui.allocate_exact_size(panel_size, egui::Sense::click());
         let hovered = response.hovered();
         page_actions_context_menu(response, self);
 
         let base_width = manhwa_target_width(rect.width());
-        let scale = if image_size.x > 0.0 {
-            base_width / image_size.x
+        let scroll_delta = if hovered {
+            ui.input(|input| input.smooth_scroll_delta().y) * -MANHWA_WHEEL_SCROLL_SENSITIVITY
         } else {
-            1.0
+            0.0
         };
-        let display_size = egui::vec2(
-            image_size.x * scale * self.manhwa_zoom,
-            image_size.y * scale * self.manhwa_zoom,
-        );
-        let max_scroll = (display_size.y - rect.height()).max(0.0);
 
-        if hovered {
-            let wheel = ui.input(|input| input.smooth_scroll_delta().y);
-            if wheel.abs() > 0.0 {
-                self.manhwa_scroll_offset -= wheel * MANHWA_WHEEL_SCROLL_SENSITIVITY;
-                ui.ctx().request_repaint();
-            }
+        if scroll_delta.abs() > 0.0 {
+            self.manhwa_scroll_offset += scroll_delta;
+            ui.ctx().request_repaint();
         }
 
-        self.resolve_manhwa_scroll_bounds(max_scroll);
-        self.last_image_width = display_size.x;
-        self.last_image_height = rect.height().min(display_size.y);
+        self.request_manhwa_pages();
+        self.normalize_manhwa_scroll(ui.ctx(), base_width);
+        self.request_manhwa_pages();
 
-        let image_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                rect.center().x - display_size.x * 0.5,
-                rect.top() - self.manhwa_scroll_offset,
-            ),
-            display_size,
-        );
+        let pages = self.manhwa_visible_pages(base_width);
+        let total_height = pages
+            .last()
+            .map(|page| page.top + page.size.y)
+            .unwrap_or(rect.height());
+        let max_scroll = (total_height - rect.height()).max(0.0);
+        self.manhwa_scroll_offset = self.manhwa_scroll_offset.clamp(0.0, max_scroll);
+        self.last_image_width = base_width * self.manhwa_zoom;
+        self.last_image_height = rect.height().min(total_height);
+
         let painter = ui.painter().with_clip_rect(rect);
-        painter.image(
-            texture_id,
-            image_rect,
-            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+        for page in pages {
+            let image_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.center().x - page.size.x * 0.5,
+                    rect.top() + page.top - self.manhwa_scroll_offset,
+                ),
+                page.size,
+            );
+            painter.image(
+                page.texture_id,
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+
+            if page.index + 1 < self.page_count {
+                let boundary_y = image_rect.bottom() + MANHWA_PAGE_GAP * 0.5;
+                painter.line_segment(
+                    [
+                        egui::pos2(image_rect.left(), boundary_y),
+                        egui::pos2(image_rect.right(), boundary_y),
+                    ],
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(72)),
+                );
+            }
+        }
     }
 
-    fn resolve_manhwa_scroll_bounds(&mut self, max_scroll: f32) {
-        if self.manhwa_scroll_offset > max_scroll + MANHWA_PAGE_TURN_OVERSCROLL {
-            if self.current_page + 1 < self.page_count {
-                self.queue_manhwa_page_turn(self.current_page + 1, max_scroll);
+    fn normalize_manhwa_scroll(&mut self, ctx: &egui::Context, base_width: f32) {
+        while self.manhwa_scroll_offset < 0.0 && self.current_page > 0 {
+            let previous_page = self.current_page - 1;
+            let Some(previous_height) = self
+                .manhwa_display_size(previous_page, base_width)
+                .map(|size| size.y)
+            else {
+                self.manhwa_scroll_offset = 0.0;
+                return;
+            };
+            if !self.textures.contains_key(&previous_page) {
+                self.manhwa_scroll_offset = 0.0;
                 return;
             }
+
+            self.current_page = previous_page;
+            self.set_flow_center(previous_page);
+            self.manhwa_scroll_offset += previous_height + MANHWA_PAGE_GAP;
+            self.queue_manhwa_page_turn(previous_page);
+            self.upload_nearby_textures(ctx);
         }
 
-        self.manhwa_scroll_offset = self.manhwa_scroll_offset.clamp(0.0, max_scroll);
+        while self.current_page + 1 < self.page_count {
+            let Some(current_height) = self
+                .manhwa_display_size(self.current_page, base_width)
+                .map(|size| size.y)
+            else {
+                return;
+            };
+            let current_extent = current_height + MANHWA_PAGE_GAP;
+            if self.manhwa_scroll_offset < current_extent {
+                break;
+            }
+            if !self.textures.contains_key(&(self.current_page + 1)) {
+                self.manhwa_scroll_offset = current_extent.min(self.manhwa_scroll_offset);
+                break;
+            }
+
+            let next_page = self.current_page + 1;
+            self.current_page = next_page;
+            self.set_flow_center(next_page);
+            self.manhwa_scroll_offset -= current_extent;
+            self.queue_manhwa_page_turn(next_page);
+            self.upload_nearby_textures(ctx);
+        }
     }
 
-    fn queue_manhwa_page_turn(&mut self, page: usize, current_scroll_offset: f32) {
+    fn request_manhwa_pages(&self) {
+        let Some(handle) = &self.handle else {
+            return;
+        };
+        if self.page_count == 0 {
+            return;
+        }
+
+        let start = self.current_page.saturating_sub(1);
+        let end = (self.current_page + 3).min(self.page_count - 1);
+        handle.request_pages((start..=end).collect());
+    }
+
+    fn queue_manhwa_page_turn(&mut self, page: usize) {
         if self.pending_manhwa_page_turn == Some(page) {
             return;
         }
 
         self.pending_manhwa_page_turn = Some(page);
-        self.manhwa_scroll_offset = current_scroll_offset;
         if let Some(handle) = &self.handle {
             handle.go_to(page);
         }
+    }
+
+    fn manhwa_visible_pages(&self, base_width: f32) -> Vec<ManhwaPageLayout> {
+        let mut pages = Vec::new();
+        let mut top = 0.0;
+
+        for page in self.current_page..self.page_count.min(self.current_page + 3) {
+            let Some(texture) = self.textures.get(&page) else {
+                break;
+            };
+            let Some(size) = self.manhwa_display_size(page, base_width) else {
+                break;
+            };
+            pages.push(ManhwaPageLayout {
+                index: page,
+                texture_id: texture.id(),
+                top,
+                size,
+            });
+            top += size.y + MANHWA_PAGE_GAP;
+        }
+
+        pages
+    }
+
+    fn manhwa_display_size(&self, page: usize, base_width: f32) -> Option<egui::Vec2> {
+        let image_size = self
+            .image_sizes
+            .get(&page)
+            .map(|[width, height]| egui::vec2(*width as f32, *height as f32))
+            .or_else(|| self.textures.get(&page).map(|texture| texture.size_vec2()))?;
+        if image_size.x <= 0.0 || image_size.y <= 0.0 {
+            return None;
+        }
+
+        let width = base_width * self.manhwa_zoom;
+        Some(egui::vec2(width, image_size.y * (width / image_size.x)))
     }
 
     fn thumbnail_strip(&mut self, ui: &mut egui::Ui) {
