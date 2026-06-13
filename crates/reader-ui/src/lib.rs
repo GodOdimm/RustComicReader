@@ -15,6 +15,7 @@ const MANHWA_NARROW_WIDTH_RATIO: f32 = 0.72;
 const MANHWA_MAX_CONTENT_WIDTH: f32 = 1180.0;
 const MANHWA_MIN_ZOOM: f32 = 0.40;
 const MANHWA_MAX_ZOOM: f32 = 3.00;
+const MANHWA_DEFAULT_ZOOM: f32 = 0.70;
 const MANHWA_ZOOM_STEP: f32 = 0.10;
 const MANHWA_WHEEL_SCROLL_SENSITIVITY: f32 = 0.65;
 const MANHWA_PAGE_GAP: f32 = 0.0;
@@ -96,7 +97,7 @@ impl ComicReaderApp {
 
         let mut app = Self {
             status: "按 O 打开 CBZ/ZIP 漫画".to_string(),
-            manhwa_zoom: 1.0,
+            manhwa_zoom: MANHWA_DEFAULT_ZOOM,
             ..Default::default()
         };
 
@@ -124,7 +125,7 @@ impl ComicReaderApp {
         self.flow_page_input.clear();
         self.last_image_width = 0.0;
         self.last_image_height = 0.0;
-        self.manhwa_zoom = 1.0;
+        self.manhwa_zoom = MANHWA_DEFAULT_ZOOM;
         self.manhwa_scroll_offset = 0.0;
         self.pending_manhwa_page_turn = None;
         self.cache_status.clear();
@@ -521,7 +522,7 @@ impl ComicReaderApp {
         if ctx.input(|input| input.key_pressed(egui::Key::H)) {
             self.manhwa_mode = !self.manhwa_mode;
             if self.manhwa_mode {
-                self.manhwa_zoom = 1.0;
+                self.manhwa_zoom = MANHWA_DEFAULT_ZOOM;
                 self.manhwa_scroll_offset = 0.0;
                 self.pending_manhwa_page_turn = None;
                 self.upload_nearby_textures(ctx);
@@ -1190,7 +1191,7 @@ fn page_actions_context_menu(response: egui::Response, app: &mut ComicReaderApp)
             app.manhwa_mode = !app.manhwa_mode;
             app.pending_manhwa_page_turn = None;
             if app.manhwa_mode {
-                app.manhwa_zoom = 1.0;
+                app.manhwa_zoom = MANHWA_DEFAULT_ZOOM;
                 app.manhwa_scroll_offset = 0.0;
                 app.upload_nearby_textures(ui.ctx());
                 app.request_manhwa_pages();
