@@ -10,6 +10,14 @@ use image_pipeline::ImageCrateDecoder;
 use reader_core::{spawn_reader, DecodedImage, ReaderEvent, ReaderHandle, ReaderOptions};
 
 const LEGACY_READING_PROGRESS_PATH: &str = "meta/reading_progress.tsv";
+const MANHWA_DEFAULT_WIDTH_RATIO: f32 = 0.66;
+const MANHWA_NARROW_WIDTH_RATIO: f32 = 0.72;
+const MANHWA_MAX_CONTENT_WIDTH: f32 = 1180.0;
+const MANHWA_MIN_ZOOM: f32 = 0.40;
+const MANHWA_MAX_ZOOM: f32 = 3.00;
+const MANHWA_ZOOM_STEP: f32 = 0.10;
+const MANHWA_WHEEL_SCROLL_SENSITIVITY: f32 = 0.65;
+const MANHWA_PAGE_TURN_OVERSCROLL: f32 = 48.0;
 
 pub fn run(initial_path: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -57,6 +65,10 @@ pub struct ComicReaderApp {
     flow_page_input: String,
     last_image_width: f32,
     last_image_height: f32,
+    manhwa_mode: bool,
+    manhwa_zoom: f32,
+    manhwa_scroll_offset: f32,
+    pending_manhwa_page_turn: Option<usize>,
     pending_resume_page: Option<usize>,
     awaiting_resume_page: Option<usize>,
     progress_store: ReadingProgressStore,
@@ -71,6 +83,7 @@ impl ComicReaderApp {
 
         let mut app = Self {
             status: "按 O 打开 CBZ/ZIP 漫画".to_string(),
+            manhwa_zoom: 1.0,
             ..Default::default()
         };
 
@@ -98,6 +111,9 @@ impl ComicReaderApp {
         self.flow_page_input.clear();
         self.last_image_width = 0.0;
         self.last_image_height = 0.0;
+        self.manhwa_zoom = 1.0;
+        self.manhwa_scroll_offset = 0.0;
+        self.pending_manhwa_page_turn = None;
         self.cache_status.clear();
         self.pending_resume_page = resume_page;
         self.awaiting_resume_page = None;
@@ -180,6 +196,8 @@ impl ComicReaderApp {
                 ReaderEvent::CurrentPage { page_index } => {
                     self.current_page = page_index;
                     self.set_flow_center(page_index);
+                    self.manhwa_scroll_offset = 0.0;
+                    self.pending_manhwa_page_turn = None;
                     self.status = format!("第 {} / {} 页", page_index + 1, self.page_count.max(1));
                     self.upload_nearby_textures(ctx);
                     self.save_progress_if_current_page_is_settled(page_index);
@@ -467,6 +485,54 @@ impl ComicReaderApp {
             return;
         }
 
+        if ctx.input(|input| input.key_pressed(egui::Key::H)) {
+            self.manhwa_mode = !self.manhwa_mode;
+            if self.manhwa_mode {
+                self.manhwa_zoom = 1.0;
+                self.manhwa_scroll_offset = 0.0;
+                self.pending_manhwa_page_turn = None;
+                self.status = "韩漫模式：上下方向键滚动，Cmd +/- 缩放，H 返回普通模式".to_string();
+            } else {
+                self.pending_manhwa_page_turn = None;
+                self.status = format!("第 {} / {} 页", self.current_page + 1, self.page_count);
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        if self.manhwa_mode {
+            let zoom_in = ctx.input(|input| {
+                input.modifiers.command
+                    && (input.key_pressed(egui::Key::Plus) || input.key_pressed(egui::Key::Equals))
+            });
+            let zoom_out =
+                ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Minus));
+            let scroll_up = ctx.input(|input| input.key_down(egui::Key::ArrowUp));
+            let scroll_down = ctx.input(|input| input.key_down(egui::Key::ArrowDown));
+
+            if zoom_in {
+                self.manhwa_zoom = (self.manhwa_zoom + MANHWA_ZOOM_STEP).min(MANHWA_MAX_ZOOM);
+                ctx.request_repaint();
+            }
+            if zoom_out {
+                self.manhwa_zoom = (self.manhwa_zoom - MANHWA_ZOOM_STEP).max(MANHWA_MIN_ZOOM);
+                ctx.request_repaint();
+            }
+            if scroll_up {
+                self.manhwa_scroll_offset -= manhwa_keyboard_scroll_step(ctx);
+                ctx.request_repaint();
+            }
+            if scroll_down {
+                self.manhwa_scroll_offset += manhwa_keyboard_scroll_step(ctx);
+                ctx.request_repaint();
+            }
+
+            if ctx.input(|input| input.key_pressed(egui::Key::S)) {
+                self.save_current_page_dialog();
+            }
+            return;
+        }
+
         let previous = ctx.input(|input| input.key_pressed(egui::Key::ArrowLeft));
         let next = ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
         let save = ctx.input(|input| input.key_pressed(egui::Key::S));
@@ -508,10 +574,6 @@ impl ComicReaderApp {
             .get(&self.current_page)
             .map(|[width, height]| egui::vec2(*width as f32, *height as f32))
             .unwrap_or_else(|| texture.size_vec2());
-        let fit = fit_size(image_size, available);
-        self.last_image_width = fit.x;
-        self.last_image_height = fit.y;
-
         let texture_id = texture.id();
 
         let panel_response = ui.interact(
@@ -520,6 +582,15 @@ impl ComicReaderApp {
             egui::Sense::click(),
         );
         page_actions_context_menu(panel_response, self);
+
+        if self.manhwa_mode {
+            self.manhwa_image_panel(ui, texture_id, image_size, available);
+            return;
+        }
+
+        let fit = fit_size(image_size, available);
+        self.last_image_width = fit.x;
+        self.last_image_height = fit.y;
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -530,6 +601,81 @@ impl ComicReaderApp {
                     page_actions_context_menu(response, self);
                 });
             });
+    }
+
+    fn manhwa_image_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        texture_id: egui::TextureId,
+        image_size: egui::Vec2,
+        available: egui::Vec2,
+    ) {
+        let panel_size = egui::vec2(available.x.max(1.0), available.y.max(1.0));
+        let (rect, response) = ui.allocate_exact_size(panel_size, egui::Sense::click());
+        let hovered = response.hovered();
+        page_actions_context_menu(response, self);
+
+        let base_width = manhwa_target_width(rect.width());
+        let scale = if image_size.x > 0.0 {
+            base_width / image_size.x
+        } else {
+            1.0
+        };
+        let display_size = egui::vec2(
+            image_size.x * scale * self.manhwa_zoom,
+            image_size.y * scale * self.manhwa_zoom,
+        );
+        let max_scroll = (display_size.y - rect.height()).max(0.0);
+
+        if hovered {
+            let wheel = ui.input(|input| input.smooth_scroll_delta().y);
+            if wheel.abs() > 0.0 {
+                self.manhwa_scroll_offset -= wheel * MANHWA_WHEEL_SCROLL_SENSITIVITY;
+                ui.ctx().request_repaint();
+            }
+        }
+
+        self.resolve_manhwa_scroll_bounds(max_scroll);
+        self.last_image_width = display_size.x;
+        self.last_image_height = rect.height().min(display_size.y);
+
+        let image_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.center().x - display_size.x * 0.5,
+                rect.top() - self.manhwa_scroll_offset,
+            ),
+            display_size,
+        );
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.image(
+            texture_id,
+            image_rect,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
+    fn resolve_manhwa_scroll_bounds(&mut self, max_scroll: f32) {
+        if self.manhwa_scroll_offset > max_scroll + MANHWA_PAGE_TURN_OVERSCROLL {
+            if self.current_page + 1 < self.page_count {
+                self.queue_manhwa_page_turn(self.current_page + 1, max_scroll);
+                return;
+            }
+        }
+
+        self.manhwa_scroll_offset = self.manhwa_scroll_offset.clamp(0.0, max_scroll);
+    }
+
+    fn queue_manhwa_page_turn(&mut self, page: usize, current_scroll_offset: f32) {
+        if self.pending_manhwa_page_turn == Some(page) {
+            return;
+        }
+
+        self.pending_manhwa_page_turn = Some(page);
+        self.manhwa_scroll_offset = current_scroll_offset;
+        if let Some(handle) = &self.handle {
+            handle.go_to(page);
+        }
     }
 
     fn thumbnail_strip(&mut self, ui: &mut egui::Ui) {
@@ -569,7 +715,7 @@ impl ComicReaderApp {
             ui.id().with("thumbnail-flow"),
             egui::Sense::click_and_drag(),
         );
-        if response.hovered() {
+        if response.hovered() && !self.manhwa_mode {
             let scroll = ui.input(|input| input.smooth_scroll_delta().y);
             if scroll.abs() > 0.0 {
                 let direction = if scroll < 0.0 { 1 } else { -1 };
@@ -1011,6 +1157,23 @@ fn fit_size(image_size: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {
 
     let scale = (available.x / image_size.x).min(available.y / image_size.y);
     image_size * scale.min(1.0)
+}
+
+fn manhwa_target_width(available_width: f32) -> f32 {
+    if available_width <= 0.0 {
+        return 0.0;
+    }
+
+    let ratio = if available_width < 900.0 {
+        MANHWA_NARROW_WIDTH_RATIO
+    } else {
+        MANHWA_DEFAULT_WIDTH_RATIO
+    };
+    (available_width * ratio).min(MANHWA_MAX_CONTENT_WIDTH)
+}
+
+fn manhwa_keyboard_scroll_step(ctx: &egui::Context) -> f32 {
+    (ctx.content_rect().height() * 0.08).clamp(36.0, 96.0)
 }
 
 fn fit_rect(image_size: egui::Vec2, bounds: egui::Rect) -> egui::Rect {
